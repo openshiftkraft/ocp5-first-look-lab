@@ -5,8 +5,8 @@ metadata:
   name: lightspeed-operator-manager-role
 rules:
 - nonResourceURLs:
-  - /ls-access
-  - /ols-metrics-access
+  - "/ls-access"
+  - "/ols-metrics-access"
   verbs:
   - get
 - apiGroups:
@@ -34,19 +34,6 @@ rules:
   - watch
 - apiGroups:
   - ""
-  resources:
-  - secrets
-  verbs:
-  - create
-  - delete
-  - deletecollection
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - ""
   resourceNames:
   - pull-secret
   resources:
@@ -55,6 +42,12 @@ rules:
   - get
   - list
   - watch
+- apiGroups:
+  - agentic.openshift.io
+  resources:
+  - agenticolsconfigs
+  verbs:
+  - get
 - apiGroups:
   - agentic.openshift.io
   resources:
@@ -144,18 +137,6 @@ rules:
   - update
   - watch
 - apiGroups:
-  - networking.k8s.io
-  resources:
-  - networkpolicies
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
   - ols.openshift.io
   resources:
   - olsconfigs
@@ -192,18 +173,49 @@ rules:
   - watch
 - apiGroups:
   - rbac.authorization.k8s.io
+  resourceNames:
+  - lightspeed-agentic-alerts-adapter-agenticolsconfig
+  - lightspeed-agentic-alerts-adapter-agenticruns
+  - lightspeed-app-server-sar-role-binding
+  - lightspeed-operator-ols-metrics-reader
+  resources:
+  - clusterrolebindings
+  verbs:
+  - delete
+  - get
+  - update
+- apiGroups:
+  - rbac.authorization.k8s.io
   resources:
   - clusterrolebindings
   - clusterroles
   - rolebindings
   verbs:
   - create
+  - list
+  - watch
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resourceNames:
+  - lightspeed-agentic-alerts-adapter-agenticolsconfig
+  - lightspeed-agentic-alerts-adapter-agenticruns
+  - lightspeed-app-server-sar-role
+  resources:
+  - clusterroles
+  verbs:
   - delete
   - get
-  - list
-  - patch
   - update
-  - watch
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resourceNames:
+  - lightspeed-agentic-alerts-adapter-alertmanager
+  resources:
+  - rolebindings
+  verbs:
+  - delete
+  - get
+  - update
 - apiGroups:
   - storage.k8s.io
   resources:
