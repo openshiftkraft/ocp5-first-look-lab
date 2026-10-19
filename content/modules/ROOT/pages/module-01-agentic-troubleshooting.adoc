@@ -205,6 +205,24 @@ The `oc agentic` CLI supports the full lifecycle of AgenticRuns: approve or deny
 . Once an AgenticRun moves to the *Proposed* phase, open the run corresponding to the `PaymentErrorRateHigh` alert to drill into the step-by-step findings and remediation plan.
 +
 image::agentic-troubleshooting-agentic-run-detail.png[AgenticRun detail for PaymentErrorRateHigh with proposed remediation,link=_images/agentic-troubleshooting-agentic-run-detail.png,window=ea-images]
++
+[IMPORTANT]
+.If a run fails or does not propose the right fix, delete it to run it again
+====
+The investigation is done by an AI model, so the result can differ from one run to the next. Delete the AgenticRun and let the agentic system start a new one if you see either of these:
+
+* The run shows *Failed*, for example with `Connection error`, `422 Unprocessable Entity` or `result CR missing checks`.
+* The `PaymentErrorRateHigh` run does not offer an option to roll back `reporting-service` to the previous version. For example, it only suggests increasing `max_connections`, or it reports that no action is needed.
+
+Delete the `PaymentErrorRateHigh` run:
+
+[source,sh,role=execute]
+----
+oc get agenticrun -n openshift-lightspeed -o name | grep -i payment | xargs oc delete -n openshift-lightspeed
+----
+
+A new run for the same alert starts within about 30 seconds. Wait for it to reach the *Proposed* phase again, then continue with the next step. For the `PodDisruptionBudgetLimit` run, use the same command with `inventory` instead of `payment`.
+====
 
 . Review the proposed remediation steps. Select the option that recommends rolling back to the last known good version — and click the *Execute remediation* button to authorize the change. It will ask you once again to confirm the execution. Click *Execute Remediation* once more to confirm.
 
