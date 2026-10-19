@@ -7,9 +7,10 @@ images:
   postgres: registry.redhat.io/rhel9/postgresql-16@sha256:42f385ac3c9b8913426da7c57e70bc6617cd237aaf697c667f6385a8c0b0118b
   mcpServer: registry.redhat.io/openshift-mcp/openshift-mcp-server-rhel9@sha256:a551fd58f7b2a7505a76ba2109ae5a8f031606605490c9c68d60f91f502f6fe5
   dataverseExporter: registry.redhat.io/lightspeed-core/dataverse-exporter-rhel9@sha256:1c7ffaead23adfb1dc6bd3adfe75c80f284d6d31f13ca427d754703c78514cb2
-  # Pinned — :main crashes on EC6 console (React 18 / SDK incompatibility)
-  agenticConsole: quay.io/redhat-user-workloads/crt-nshift-lightspeed-tenant/lightspeed-agentic-console@sha256:300cf7c966df5ccbb04fbbdcc8d4e162a05ae76f056e96b6846a760d3f3d237c
-  agenticSandbox: quay.io/redhat-user-workloads/crt-nshift-lightspeed-tenant/lightspeed-agentic-sandbox@sha256:230d72bdb84c80f6cfebaa54eb2a1b9fc72098b405d46aaa38c7113803ba0ede
+  # :main as of 2026-10-19 (vcs-ref 1f6e07c8) — finds results by run UID, as the agentic operator labels them
+  agenticConsole: quay.io/redhat-user-workloads/crt-nshift-lightspeed-tenant/lightspeed-agentic-console@sha256:b42d54b5863cdc464c54279c03f55f8c710a407e87e0abf88a658187e6a952a3
+  # Batch-mode sandbox that works with MaaS; needs an agentic operator that mounts /input
+  agenticSandbox: quay.io/dialvare/sandbox-maas@sha256:7d175437154dd12938d2884d3daa302a55c1e0542ce57f45cb9ae231f69f4da0
   alertsAdapter: quay.io/redhat-user-workloads/crt-nshift-lightspeed-tenant/lightspeed-agentic-alerts-adapter@sha256:b7f208290d7509124961850efe87c69422b754a29b5249283f4f3430533fc8c3
   otelCollector: registry.redhat.io/openshift-lightspeed/otelcol-lightspeed-rhel9@sha256:5462356c2e933da812e7a8185f11f01baf5bb7e828e4ed8bf90b70a74d218e4a
   rhokp: registry.redhat.io/offline-knowledge-portal/rhokp-rhel9@sha256:adbe513585a026c8392e27e7a8f3618d4edb5a90a8ec2bb79914765cb9e929e4
