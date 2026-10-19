@@ -1,18 +1,18 @@
 namespace: openshift-lightspeed
 
 images:
-  operator: registry.redhat.io/openshift-lightspeed/lightspeed-rhel9-operator@sha256:71abcf4b043e20096a670badf767f4d99e30a34fc21326750621392d3f10004e
-  serviceApi: registry.redhat.io/openshift-lightspeed/lightspeed-service-api-rhel9@sha256:958693ae1cdd0c1549d8ad9d618643da6cfb73196742723c3d78f7f023a70502
-  consolePlugin: registry.redhat.io/openshift-lightspeed/lightspeed-console-plugin-rhel9@sha256:b935868e60f03e5d16849caaf1789feaf2da2ab1358d32d702cfe0708124e53d
+  operator: registry.redhat.io/openshift-lightspeed/lightspeed-rhel9-operator@sha256:792b6518ddfd7699e9504ef556451b130500ab4e1cea2e62d881c2d86b171804
+  serviceApi: registry.redhat.io/openshift-lightspeed/lightspeed-service-api-rhel9@sha256:13e7d109d89454d3ae34b609b9968f5d0fd93cc3ab17e7c32c4e78d311b45ba6
+  consolePlugin: registry.redhat.io/openshift-lightspeed/lightspeed-console-plugin-rhel9@sha256:5f3f1ce3fb140ddcb9c1600a93931c0a98c6ec610f32003a822300f4aa3899bd
   postgres: registry.redhat.io/rhel9/postgresql-16@sha256:42f385ac3c9b8913426da7c57e70bc6617cd237aaf697c667f6385a8c0b0118b
-  mcpServer: registry.redhat.io/openshift-lightspeed/openshift-mcp-server-rhel9@sha256:588577fec9f42aff4e3e4b3c7fdf1d1c6e2ead441978e25c0b7775b106d5baaf
+  mcpServer: registry.redhat.io/openshift-mcp/openshift-mcp-server-rhel9@sha256:a551fd58f7b2a7505a76ba2109ae5a8f031606605490c9c68d60f91f502f6fe5
   dataverseExporter: registry.redhat.io/lightspeed-core/dataverse-exporter-rhel9@sha256:1c7ffaead23adfb1dc6bd3adfe75c80f284d6d31f13ca427d754703c78514cb2
   # Pinned — :main crashes on EC6 console (React 18 / SDK incompatibility)
   agenticConsole: quay.io/redhat-user-workloads/crt-nshift-lightspeed-tenant/lightspeed-agentic-console@sha256:300cf7c966df5ccbb04fbbdcc8d4e162a05ae76f056e96b6846a760d3f3d237c
   agenticSandbox: quay.io/redhat-user-workloads/crt-nshift-lightspeed-tenant/lightspeed-agentic-sandbox@sha256:230d72bdb84c80f6cfebaa54eb2a1b9fc72098b405d46aaa38c7113803ba0ede
   alertsAdapter: quay.io/redhat-user-workloads/crt-nshift-lightspeed-tenant/lightspeed-agentic-alerts-adapter@sha256:b7f208290d7509124961850efe87c69422b754a29b5249283f4f3430533fc8c3
-  otelCollector: quay.io/redhat-user-workloads/crt-nshift-lightspeed-tenant/lightspeed-otel-collector:main
-  rhokp: registry.redhat.io/offline-knowledge-portal/rhokp-rhel9@sha256:f46082f2dc2972582f3b85ed2a563b554d0aba3255ba2f00835e65f4929ae9a9
+  otelCollector: registry.redhat.io/openshift-lightspeed/otelcol-lightspeed-rhel9@sha256:5462356c2e933da812e7a8185f11f01baf5bb7e828e4ed8bf90b70a74d218e4a
+  rhokp: registry.redhat.io/offline-knowledge-portal/rhokp-rhel9@sha256:adbe513585a026c8392e27e7a8f3618d4edb5a90a8ec2bb79914765cb9e929e4
 
 llm:
   apiUrl: ""
