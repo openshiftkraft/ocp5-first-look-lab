@@ -22,14 +22,14 @@ common:
   password: ""
 
 acs:
-  enabled: true
+  enabled: false
   name: acs
   namespace: acs
   clusterName: local-cluster
   adminPassword: ""
 
 acsVirt:
-  enabled: true
+  enabled: false
   name: acs-virt
   namespace: acs-virt
 
@@ -49,7 +49,7 @@ mcpGateway:
   namespace: mcp-gateway
 
 acsMcpServer:
-  enabled: true
+  enabled: false
   name: acs-mcp-server
   namespace: acs-mcp
 
