@@ -1,0 +1,10 @@
+{{- if .Values.sandboxBuild.enabled }}
+---
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: sandbox-maas-stream-custom
+  namespace: {{ .Values.namespace }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+{{- end }}

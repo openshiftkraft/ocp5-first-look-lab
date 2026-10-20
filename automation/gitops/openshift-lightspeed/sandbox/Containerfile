@@ -1,0 +1,10 @@
+# sandbox-maas with the structured-output reformat call streamed (see
+# patch_reformat_stream.py). Built in-cluster by the sandbox-maas-stream-custom
+# BuildConfig; the patch script is mounted into the build context from a ConfigMap.
+ARG BASE_IMAGE=quay.io/dialvare/sandbox-maas@sha256:7d175437154dd12938d2884d3daa302a55c1e0542ce57f45cb9ae231f69f4da0
+FROM ${BASE_IMAGE}
+
+USER 0
+COPY patch/patch_reformat_stream.py /tmp/patch_reformat_stream.py
+RUN python3.12 /tmp/patch_reformat_stream.py && rm -f /tmp/patch_reformat_stream.py
+USER 1001

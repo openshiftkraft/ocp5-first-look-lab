@@ -1,0 +1,36 @@
+{{- if .Values.sandboxBuild.enabled }}
+---
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: sandbox-maas-stream-custom
+  namespace: {{ .Values.namespace }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  runPolicy: Serial
+  source:
+    type: Dockerfile
+    dockerfile: |
+{{ .Files.Get "sandbox/Containerfile" | indent 6 }}
+    configMaps:
+      - configMap:
+          name: sandbox-maas-stream-custom-patch
+        destinationDir: patch
+  strategy:
+    type: Docker
+    dockerStrategy:
+      buildArgs:
+        - name: BASE_IMAGE
+          value: {{ .Values.sandboxBuild.baseImage | quote }}
+  output:
+    to:
+      kind: ImageStreamTag
+      name: sandbox-maas-stream-custom:latest
+  # Builds once when the BuildConfig is created; after changing the patch script,
+  # run: oc start-build sandbox-maas-stream-custom -n {{ .Values.namespace }}
+  triggers:
+    - type: ConfigChange
+  resources:
+    {{- toYaml .Values.sandboxBuild.resources | nindent 4 }}
+{{- end }}

@@ -1,0 +1,13 @@
+{{- if .Values.sandboxBuild.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sandbox-maas-stream-custom-patch
+  namespace: {{ .Values.namespace }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+data:
+  patch_reformat_stream.py: |
+{{ .Files.Get "sandbox/patch_reformat_stream.py" | indent 4 }}
+{{- end }}

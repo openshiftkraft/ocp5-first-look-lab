@@ -15,8 +15,8 @@ spec:
     name: openai
   model: {{ .Values.llm.model | quote }}
   timeouts:
-    analysisSeconds: 500
-    executionSeconds: 500
-    verificationSeconds: 500
+    analysisSeconds: 1800
+    executionSeconds: 1800
+    verificationSeconds: 1800
 {{- end }}
 {{- end }}
