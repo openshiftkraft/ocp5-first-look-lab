@@ -9,8 +9,9 @@ images:
   dataverseExporter: registry.redhat.io/lightspeed-core/dataverse-exporter-rhel9@sha256:1c7ffaead23adfb1dc6bd3adfe75c80f284d6d31f13ca427d754703c78514cb2
   # :main as of 2026-10-19 (vcs-ref 1f6e07c8) — finds results by run UID, as the agentic operator labels them
   agenticConsole: quay.io/redhat-user-workloads/crt-nshift-lightspeed-tenant/lightspeed-agentic-console@sha256:b42d54b5863cdc464c54279c03f55f8c710a407e87e0abf88a658187e6a952a3
-  # Batch-mode sandbox that works with MaaS; needs an agentic operator that mounts /input
-  agenticSandbox: quay.io/dialvare/sandbox-maas@sha256:7d175437154dd12938d2884d3daa302a55c1e0542ce57f45cb9ae231f69f4da0
+  # sandbox-maas with its JSON reformat call streamed, built in-cluster from
+  # sandbox/ (see sandboxBuild below). Needs an agentic operator that mounts /input.
+  agenticSandbox: image-registry.openshift-image-registry.svc:5000/openshift-lightspeed/sandbox-maas-stream-custom:latest
   alertsAdapter: quay.io/redhat-user-workloads/crt-nshift-lightspeed-tenant/lightspeed-agentic-alerts-adapter@sha256:b7f208290d7509124961850efe87c69422b754a29b5249283f4f3430533fc8c3
   otelCollector: registry.redhat.io/openshift-lightspeed/otelcol-lightspeed-rhel9@sha256:5462356c2e933da812e7a8185f11f01baf5bb7e828e4ed8bf90b70a74d218e4a
   rhokp: registry.redhat.io/offline-knowledge-portal/rhokp-rhel9@sha256:adbe513585a026c8392e27e7a8f3618d4edb5a90a8ec2bb79914765cb9e929e4
@@ -34,3 +35,17 @@ agentic:
 
 idms:
   enabled: false
+
+# In-cluster build of the agentic sandbox (images.agenticSandbox points at its output).
+# sandbox-maas sends its final JSON reformat as one silent request; MaaS drops
+# connections that stay silent for 60s, so long results fail with "Connection error".
+sandboxBuild:
+  enabled: true
+  baseImage: quay.io/dialvare/sandbox-maas@sha256:7d175437154dd12938d2884d3daa302a55c1e0542ce57f45cb9ae231f69f4da0
+  resources:
+    limits:
+      cpu: "1"
+      memory: 1Gi
+    requests:
+      cpu: 100m
+      memory: 256Mi
