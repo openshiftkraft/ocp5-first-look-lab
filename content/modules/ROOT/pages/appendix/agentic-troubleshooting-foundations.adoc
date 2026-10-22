@@ -1,0 +1,273 @@
+= Appendix - Technical Foundations: Agentic Troubleshooting
+
+include::partial$_attributes.adoc[]
+
+:page-toclevels: 2
+
+This appendix explains how the Agentic Troubleshooting environment is built, and above all how access control works: what the AI is allowed to see and change, under which identity, and who decides. Read it after (or alongside) the xref:module-01-agentic-troubleshooting.adoc[Agentic Troubleshooting] module if you want to understand what happens behind each exercise.
+
+Everything described here is deployed by OpenShift GitOps (Argo CD) from Helm charts in the lab repository, under `automation/gitops/`.
+
+== In One Sentence
+
+In the chat, Lightspeed acts *with your own permissions* through the OpenShift MCP Server; in autonomous runs, each step of the agent runs under its *own short-lived service account*, which can read the cluster but can only change it with the exact permissions listed in the remediation option a human approved.
+
+== Two Modes, Two Identities
+
+[cols="1,2,2",options="header"]
+|===
+|
+|User-initiated (Exercises 1–3)
+|Autonomous agentic runs (Exercise 4)
+
+|Started by
+|You, in the Lightspeed chat (troubleshooting mode)
+|The alerts adapter, when a critical alert fires
+
+|Identity used against the cluster
+|*Your* console user token
+|A *per-run, per-step* service account created by the agentic operator
+
+|What it can read
+|Whatever your RBAC allows
+|Cluster-wide read (`cluster-reader`) and metrics (`cluster-monitoring-view`)
+
+|What it can change
+|Whatever your RBAC allows, after you approve sensitive tools
+|Only the RBAC rules of the remediation option that was approved, only during execution
+
+|Human control
+|Tool approval prompts in the chat
+|`ApprovalPolicy` gates per stage, and `AgenticRunApproval` decisions
+|===
+
+== Building Blocks
+
+All components run in the `openshift-lightspeed` namespace unless stated otherwise.
+
+=== OpenShift Lightspeed
+
+* *Lightspeed operator* — deploys the Lightspeed service, its console plugin and its PostgreSQL conversation cache from the `OLSConfig` CR named `cluster`.
+* *`OLSConfig`* — declares the LLM provider (credentials in the `llm-credentials` secret), enables the `MCPServer` feature gate, and registers the OpenShift MCP Server as Lightspeed's tool provider:
++
+[source,yaml]
+----
+mcpServers:
+  - name: openshift-mcp
+    url: http://openshift-mcp-server.openshift-mcp.svc.cluster.local:8080/mcp
+    headers:
+      - name: kubernetes-authorization
+        valueFrom:
+          type: kubernetes
+----
+* *OpenShift MCP Server* (`openshift-mcp` namespace) — the same server used in the MCP Server module, running in token passthrough mode. See xref:appendix/mcp-server-foundations.adoc[Technical Foundations: MCP Server] for how it works.
+
+=== The Agentic Layer
+
+* *Agentic operator* `lightspeed-agentic-operator` — watches `AgenticRun` resources and drives each one through analysis, execution and verification. Each step runs in an *ephemeral sandbox pod* that hosts the LLM-backed agent and is deleted when the step ends.
+* *Alerts adapter* `lightspeed-agentic-alerts-adapter` — polls Alertmanager every 30 seconds and creates an `AgenticRun` for each new firing alert routed to an allowed receiver. It is configured by the `alerts-adapter-config` ConfigMap.
+* *Agentic console* — the *Agentic Runs* pages in the OpenShift console, and the `oc agentic` CLI plugin.
+
+The agentic operator is configured with these custom resources:
+
+[cols="1,3",options="header"]
+|===
+|Resource
+|Role
+
+|`LLMProvider` `openai`
+|The OpenAI-compatible LLM endpoint and its credentials secret (`llm-creds-openai`)
+
+|`Agent` `default`
+|Which LLM provider and model the agent uses, and the time limits for each step (1800 seconds here)
+
+|`ApprovalPolicy` `cluster`
+|Which stages proceed automatically and which wait for a human decision
+
+|`AgenticRun`
+|One investigation: the alert or request, its current phase, and its results
+
+|`AgenticRunApproval`
+|The human decisions for one run: approve or deny a stage, and which remediation option to execute
+
+|`AnalysisResult`, `ExecutionResult`, `VerificationResult`, `EscalationResult`
+|What each step produced, written by the sandbox pod of that step
+|===
+
+=== Observability
+
+* *Cluster Observability Operator* with a `UIPlugin` that enables Perses dashboards in the console (*Observe > Dashboards (Perses)*).
+* *`PersesGlobalDatasource`* pointing at the Thanos querier, used by the inline charts that Lightspeed generates (Exercise 3).
+* *User workload monitoring*, enabled so that the `PrometheusRule` resources of the demo applications raise alerts such as `PaymentErrorRateHigh`.
+
+=== Demo Workloads
+
+Pre-deployed applications with intentional faults, in the `payments`, `inventory`, `catalog-service`, `user-imports` and `service-mesh` namespaces. Each fault leaves a causal trail (alert, metrics, logs, events) for the AI to follow — for example a bad `reporting-service` release that exhausts PostgreSQL connections, or an image tag typo (`laetst`) behind a PodDisruptionBudget alert.
+
+== User-Initiated Troubleshooting: Your Own Permissions
+
+----
+You (console) ──▶ Lightspeed chat ──▶ LLM decides which tools to call
+                        │
+                        │  kubernetes-authorization: <your token>
+                        ▼
+                  OpenShift MCP Server ── same token (passthrough) ──▶ kube-apiserver / Thanos
+                                                                          │
+                                                                          ▼
+                                                        your RBAC decides what succeeds
+----
+
+* Lightspeed does not have a privileged identity of its own for chat tool calls. With `valueFrom.type: kubernetes`, it forwards *the token of the user logged in to the console*, and the MCP server passes it on to the Kubernetes API. A user with read-only access gets a read-only assistant.
+* *Tool approval* adds a human check on top of RBAC. The `OLSConfig` field `spec.ols.toolsApprovalConfig.approvalType` controls it:
+** `tool_annotations` (the default, used in this lab) — tools that the MCP server annotates as sensitive, such as `pod_exec`, require you to click *Approve* in the chat (Exercise 1).
+** `always` — every tool call requires approval.
+** `never` — no approval prompts.
+* The mitigation plan suggested in the chat is *advice only*: nothing is changed unless you, or a tool you approve, change it.
+
+== Autonomous Agentic Runs: Per-Step Service Accounts
+
+=== From Alert to AgenticRun
+
+The alerts adapter has a narrow identity, the `lightspeed-agentic-alerts-adapter` service account:
+
+* `monitoring-alertmanager-view` in `openshift-monitoring` — to read firing alerts.
+* `create`, `list` and `get` on `agenticruns` — to start investigations.
+
+It cannot read or change workloads itself. By default `filtering.allowedReceivers` is empty, so no runs are created. In Exercise 4 you uncomment `critical`, which makes the adapter process alerts routed to the `critical` receiver. The `postRunDelay` of 1 hour prevents the same alert from being investigated again right after a run finishes.
+
+=== The Three Stages and Their Gates
+
+----
+AgenticRun ──▶ Analysis ──▶ Proposed ──▶ Execution ──▶ Verification ──▶ Completed
+                  ▲                          ▲               ▲
+             gate: Analysis            gate: Execution   gate: Verification
+             (Automatic in Ex. 4)      (Manual)          (Automatic)
+----
+
+The `ApprovalPolicy` named `cluster` defines a gate for each stage. A stage starts when the policy says `Automatic`, *or* when an `AgenticRunApproval` contains an approval for that stage. The lab ships with Analysis and Execution set to `Manual`; Exercise 4 switches Analysis to `Automatic` so investigations start immediately, while Execution stays `Manual`. `maxConcurrentRuns: 5` limits how many runs can be active at the same time.
+
+=== Who Runs Each Step
+
+For every step of every run, the agentic operator creates a dedicated service account in `openshift-lightspeed`, named after the step and the run UID:
+
+[cols="1,1,3",options="header"]
+|===
+|Step
+|Service account
+|Permissions
+
+|Analysis
+|`ls-anl-<run-uid>`
+|Read-only: copies of the `cluster-reader` and `cluster-monitoring-view` bindings, plus permission to create its own `AnalysisResult`
+
+|Execution
+|`ls-exe-<run-uid>`
+|Read-only bindings, plus a `Role`/`RoleBinding` (and if needed a `ClusterRole`/`ClusterRoleBinding`) named `ls-exec-<run-uid>` containing *only the rules of the approved option*, plus permission to create its `ExecutionResult`
+
+|Verification
+|`ls-ver-<run-uid>`
+|Read-only, plus permission to create its `VerificationResult`
+|===
+
+The read-only permissions are not hardcoded. The operator discovers every `ClusterRoleBinding` whose subject is the `lightspeed-agent` service account, and creates a copy of each one for the step's service account. In this lab, the `openshift-agentic-lightspeed` chart creates two such bindings:
+
+[source,yaml]
+----
+lightspeed-agent-cluster-reader   ──▶ ClusterRole cluster-reader
+lightspeed-agent-monitoring-view  ──▶ ClusterRole cluster-monitoring-view
+----
+
+All these service accounts and bindings are labelled with the run UID and deleted when the step or run ends.
+
+=== Where Write Permissions Come From
+
+During analysis, the agent proposes one or more *remediation options*. Each option lists the exact actions it would take, and the *RBAC rules* it needs to take them — for example `patch` on `deployments` named `reporting-service` in the `payments` namespace — with a justification for each rule.
+
+When you click *Execute remediation* on an option:
+
+. The console writes your decision to the run's `AgenticRunApproval`. A mutating webhook of the agentic operator records *who* approved and when, in `spec.approver`, from the authenticated request — the approver cannot be spoofed by the client.
+. The operator creates a `Role` and `RoleBinding` in each target namespace (and a `ClusterRole` and `ClusterRoleBinding` for cluster-scoped rules) with exactly the rules of the selected option, bound to the execution service account `ls-exe-<run-uid>`.
+. The execution sandbox pod runs with that service account, performs the actions, and reports an `ExecutionResult`.
+. The execution RBAC is deleted afterwards. The verification step runs read-only again.
+
+This is why the agentic operator itself is bound to `cluster-admin` in this lab: Kubernetes only lets a service account grant permissions it holds itself, and the operator must be able to grant whatever an approved option requires.
+
+IMPORTANT: Approving an option means approving its RBAC rules. Review both the proposed actions and the permissions they require before clicking *Execute remediation*.
+
+=== Who Can Approve
+
+Approving is an ordinary Kubernetes write: whoever can create or update `agenticrunapprovals` in `openshift-lightspeed` can approve or deny runs — from the console, or with `oc agentic run approve` / `oc agentic run deny`. In this lab you are a cluster administrator, so you can. In production, grant this permission to the operations leads who own remediation decisions, and keep it separate from the permission to create `AgenticRuns`.
+
+=== Emergency Stop
+
+A `ValidatingAdmissionPolicy` named `agentic.openshift.io-agenticrun-suspension` rejects the creation of any new `AgenticRun` when the `AgenticOLSConfig` named `cluster` has `spec.suspended: true`. This gives administrators a single switch to stop all new autonomous investigations.
+
+== Inspect It Yourself
+
+. View the gates of the approval policy:
++
+[source,sh,role=execute]
+----
+oc get approvalpolicy cluster -n openshift-lightspeed -o jsonpath='{.spec}' | jq
+----
+
+. View the read-only bindings that every step inherits:
++
+[source,sh,role=execute]
+----
+oc get clusterrolebinding lightspeed-agent-cluster-reader lightspeed-agent-monitoring-view \
+  -o custom-columns=BINDING:.metadata.name,ROLE:.roleRef.name,SUBJECT:.subjects[0].name
+----
+
+. View the narrow permissions of the alerts adapter:
++
+[source,sh,role=execute]
+----
+oc auth can-i create agenticruns -n openshift-lightspeed \
+  --as=system:serviceaccount:openshift-lightspeed:lightspeed-agentic-alerts-adapter
+oc auth can-i patch deployments -n payments \
+  --as=system:serviceaccount:openshift-lightspeed:lightspeed-agentic-alerts-adapter
+----
++
+The first command returns `yes`, the second `no`.
+
+. While a run is in progress, list the per-step service accounts and the bindings created for them:
++
+[source,sh,role=execute]
+----
+oc get serviceaccounts -n openshift-lightspeed | grep -E '^ls-'
+oc get clusterrolebindings | grep -E '^ls-'
+----
+
+. While an execution is in progress, find the Role created from the approved option:
++
+[source,sh,role=execute]
+----
+oc get roles -A | grep ls-exec
+----
+
+. See who approved each run:
++
+[source,sh,role=execute]
+----
+oc get agenticrunapprovals -n openshift-lightspeed \
+  -o custom-columns=NAME:.metadata.name,APPROVER:.spec.approver.username,AT:.spec.approver.approvedAt
+----
+
+== Key Points to Remember
+
+* *Chat mode inherits your identity.* Lightspeed forwards your token through the MCP server, so your RBAC applies, and sensitive tools need your approval in the chat.
+* *Autonomous mode uses least privilege per step.* Analysis and verification can only read. Execution receives write permissions only for the approved option, only for the duration of that step.
+* *Humans gate the risky stage.* The `ApprovalPolicy` decides which stages need a decision, and the approver's identity is recorded on every approval.
+* *Permissions are visible Kubernetes objects.* Every grant is a labelled `Role`, `ClusterRole` or binding that you can inspect and audit with standard tools.
+
+[NOTE]
+.Lab simplifications
+====
+To keep the exercises short, this environment takes shortcuts you should not reproduce in production:
+
+* The agentic operator and sandbox images are development builds, and the agentic CRDs are installed from the upstream repository by a Job.
+* The agentic operator service account is bound to `cluster-admin` rather than to a narrower set of permissions.
+* You approve runs as a cluster administrator; in production, approval rights should be granted to a dedicated group.
+* Analysis is switched to `Automatic` in Exercise 4 so you don't have to approve each investigation.
+====

@@ -1,0 +1,169 @@
+= Appendix - Technical Foundations: MCP Server
+
+include::partial$_attributes.adoc[]
+
+:page-toclevels: 2
+
+This appendix explains how the MCP Server environment is built, and above all how access control works: who is allowed to do what through the MCP server, and which component makes that decision. Read it after (or alongside) the xref:module-02-mcp-server.adoc[MCP Server] module if you want to understand what happens behind each exercise.
+
+Everything described here is deployed by OpenShift GitOps (Argo CD) from Helm charts in the lab repository, under `automation/gitops/`.
+
+== In One Sentence
+
+The MCP server does not make authorization decisions: it forwards each caller's own OpenShift token to the Kubernetes API, so *standard OpenShift RBAC* decides what every tool call is allowed to do.
+
+== Building Blocks
+
+=== Keycloak
+
+Red Hat Build of Keycloak runs in the `keycloak` namespace with a realm named `keycloak`. It is provided by the base environment, and OpenShift OAuth is configured with Keycloak as an OpenID Connect identity provider. This is why a Keycloak user can run `oc login -u <user> -p <password>`.
+
+In this module, Keycloak is *only an identity store*: it checks the user's password when they log in to OpenShift. It does not define any MCP permissions.
+
+=== The `mcp-cli` Pod
+
+The `mcp-cli` pod in the `mcp-cli` namespace runs https://opencode.ai[opencode^], pre-configured with the lab LLM and with the MCP server:
+
+[source,json]
+----
+"openshift": {
+  "type": "remote",
+  "url": "https://mcp-server.<cluster-domain>/mcp",
+  "headers": { "Authorization": "Bearer {env:OPENSHIFT_MCP_TOKEN}" }
+}
+----
+
+opencode resolves `{env:OPENSHIFT_MCP_TOKEN}` when it starts. That is why the exercises switch users by restarting opencode with a different token, for example `env OPENSHIFT_MCP_TOKEN=$MCP_VIEWER_TOKEN opencode`.
+
+=== The MCP Server
+
+All resources live in the `openshift-mcp` namespace.
+
+* *Deployment* `openshift-mcp-server` — the OpenShift MCP Server (tech preview image), exposed in-cluster by a Service on port 8080 and externally by an edge-terminated Route at `mcp-server.<cluster-domain>`.
+* *ConfigMap* `mcp-config` — the server configuration (`config.toml`).
+* *Setup Job* `mcp-server-keycloak-setup` — creates the `mcp-admin` and `mcp-viewer` users in Keycloak with random passwords, and stores those passwords in the `mcp-user-credentials` secret.
+* *ClusterRoleBindings* — one per lab user, binding the OpenShift `User` of the same name to a cluster role.
+
+== The Configuration That Matters
+
+[source,toml]
+----
+toolsets = ["core","config","metrics","netedge","openshift","ossm"]
+read_only = false
+cluster_auth_mode = "passthrough"
+skip_jwt_verification = true
+
+[toolset_configs.metrics]
+auth_mode = "header"
+----
+
+`toolsets`:: Which groups of tools the server exposes. Every client sees the same tool list, whoever the user is.
+`cluster_auth_mode = "passthrough"`:: The server does not act with its own identity. It forwards the caller's bearer token to the Kubernetes API for every operation.
+`skip_jwt_verification = true`:: The server does not validate the token itself. The Kubernetes API server validates it (and rejects it with `401` if it is invalid or expired).
+`auth_mode = "header"` (metrics, netedge):: The caller's token is also forwarded to Thanos/Prometheus. This is why PromQL queries require the user to have `cluster-monitoring-view` access.
+`read_only`:: A server-wide switch. When enabled (Exercise 8), write tools are removed from the tool list for *everyone*, including cluster administrators.
+
+The ConfigMap also sets `server_instructions`, asking the AI to warn and request confirmation before destructive operations (Exercise 7). These instructions are guidance for the model — they are not an enforcement mechanism.
+
+== Lab Users and Their Permissions
+
+[cols="1,1,2",options="header"]
+|===
+|User
+|ClusterRoleBinding
+|Cluster role
+
+|`mcp-admin`
+|`mcp-server-mcp-admin`
+|`cluster-admin`
+
+|`mcp-viewer`
+|`mcp-server-mcp-viewer`
+|`view` (read-only)
+|===
+
+== Request Flow
+
+----
+oc login -u mcp-viewer ──▶ OpenShift OAuth ──▶ Keycloak (password check)
+                                │
+                                ▼
+                OpenShift OAuth token (sha256~...), identity = User "mcp-viewer"
+
+opencode ── Authorization: Bearer <token> ──▶ MCP Server
+                                                 │ same token (passthrough)
+                                                 ▼
+                                          kube-apiserver
+                                                 │ RBAC: "view" only
+                                                 ▼
+               403  configmaps "hack" is forbidden: User "mcp-viewer" cannot patch ...
+----
+
+The MCP server never decides whether `mcp-viewer` may create a ConfigMap. It simply relays the request with the user's own token, and the Kubernetes API server applies the same RBAC rules that would apply to `oc create`. This is what you observe in Exercise 4.
+
+== How to Control Who Can Do What
+
+* *To grant or restrict cluster access*, change the user's Kubernetes RBAC: bind a different `ClusterRole`, or use namespaced `RoleBinding` objects to limit a user to specific projects. Nothing changes in the MCP server.
+* *To restrict which tools exist*, change the server configuration: remove toolsets from `toolsets`, or enable `read_only`. These settings apply to all users.
+* *There is no per-user tool list.* `mcp-viewer` still sees the create and delete tools — calling them fails at the Kubernetes API. Authorization is enforced when a tool is *called*, not when tools are listed.
+
+== OpenShift Lightspeed Uses the Same Server
+
+The `OLSConfig` registers the same MCP server through its in-cluster Service URL:
+
+[source,yaml]
+----
+mcpServers:
+  - name: openshift-mcp
+    url: http://openshift-mcp-server.openshift-mcp.svc.cluster.local:8080/mcp
+    headers:
+      - name: kubernetes-authorization
+        valueFrom:
+          type: kubernetes
+----
+
+With `type: kubernetes`, Lightspeed forwards the token of the user logged in to the web console, so the same RBAC rules apply. Because the token always belongs to the console user, you cannot switch identities from Lightspeed — which is why Exercises 4 and 8 use opencode.
+
+== Inspect It Yourself
+
+. View the MCP server configuration:
++
+[source,sh,role=execute]
+----
+oc get configmap mcp-config -n openshift-mcp -o jsonpath='{.data.config\.toml}'
+----
+
+. View the role bound to each lab user:
++
+[source,sh,role=execute]
+----
+oc get clusterrolebinding mcp-server-mcp-admin mcp-server-mcp-viewer \
+  -o custom-columns=BINDING:.metadata.name,ROLE:.roleRef.name,USER:.subjects[0].name
+----
+
+. Ask the API server the same question the MCP server relays on behalf of `mcp-viewer`:
++
+[source,sh,role=execute]
+----
+oc auth can-i create configmaps -n default --as=mcp-viewer
+oc auth can-i list pods -n default --as=mcp-viewer
+----
++
+The first command returns `no`, the second `yes` — exactly what the AI experiences through the MCP server.
+
+== Key Points to Remember
+
+* The MCP server is a *relay*: with token passthrough, each tool call runs with the caller's own identity.
+* *Kubernetes RBAC is the single source of truth* for what a user can do, whether they use `oc`, the console, or an AI client.
+* *Server-level settings* (`toolsets`, `read_only`) shape the tool list for everyone; *RBAC* shapes what each user can actually do.
+* The MCP server answers "may this user perform this operation on the cluster?". The xref:appendix/mcp-gateway-foundations.adoc[MCP Gateway] adds a different layer: "may this user call this tool at all?".
+
+[NOTE]
+.Lab simplifications
+====
+To keep the exercises short, this environment takes shortcuts you should not reproduce in production:
+
+* Tokens are obtained with `oc login -u <user> -p <password>` from the command line, and pasted into the client as environment variables.
+* TLS is terminated at the OpenShift router, and in-cluster calls to Prometheus skip certificate verification.
+* `mcp-admin` is bound to `cluster-admin` to keep the write exercises simple; real users should get the narrowest role that fits their task.
+====
