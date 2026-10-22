@@ -260,14 +260,3 @@ oc get agenticrunapprovals -n openshift-lightspeed \
 * *Autonomous mode uses least privilege per step.* Analysis and verification can only read. Execution receives write permissions only for the approved option, only for the duration of that step.
 * *Humans gate the risky stage.* The `ApprovalPolicy` decides which stages need a decision, and the approver's identity is recorded on every approval.
 * *Permissions are visible Kubernetes objects.* Every grant is a labelled `Role`, `ClusterRole` or binding that you can inspect and audit with standard tools.
-
-[NOTE]
-.Lab simplifications
-====
-To keep the exercises short, this environment takes shortcuts you should not reproduce in production:
-
-* The agentic operator and sandbox images are development builds, and the agentic CRDs are installed from the upstream repository by a Job.
-* The agentic operator service account is bound to `cluster-admin` rather than to a narrower set of permissions.
-* You approve runs as a cluster administrator; in production, approval rights should be granted to a dedicated group.
-* Analysis is switched to `Automatic` in Exercise 4 so you don't have to approve each investigation.
-====

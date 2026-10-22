@@ -214,14 +214,3 @@ oc get mcpserverregistration -n mock-mcp-servers \
 * *Tool discovery is not filtered per user.* Authorization is enforced when a tool is *called*.
 * *This token is not interchangeable* with the one used in the MCP Server module: the gateway expects a Keycloak JWT that it validates against the realm's issuer.
 * *Gateway authorization and Kubernetes RBAC are complementary.* The gateway answers "may this user call this tool?", while RBAC answers "may this user perform this operation on the cluster?". Placing an MCP server that uses token passthrough behind the gateway would combine both checks — this lab demonstrates each layer separately.
-
-[NOTE]
-.Lab simplifications
-====
-To keep the exercises short, this environment takes shortcuts you should not reproduce in production:
-
-* The `mcp-gateway` client secret and the `user1` / `user2` passwords are fixed values in the Helm chart.
-* Tokens are obtained with the OAuth password grant from the command line, rather than the authorization code flow in a browser.
-* TLS is terminated at the OpenShift router, and in-cluster calls to Keycloak skip certificate verification.
-* Access tokens are valid for 8 hours.
-====

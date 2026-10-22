@@ -157,13 +157,3 @@ The first command returns `no`, the second `yes` — exactly what the AI experie
 * *Kubernetes RBAC is the single source of truth* for what a user can do, whether they use `oc`, the console, or an AI client.
 * *Server-level settings* (`toolsets`, `read_only`) shape the tool list for everyone; *RBAC* shapes what each user can actually do.
 * The MCP server answers "may this user perform this operation on the cluster?". The xref:appendix/mcp-gateway-foundations.adoc[MCP Gateway] adds a different layer: "may this user call this tool at all?".
-
-[NOTE]
-.Lab simplifications
-====
-To keep the exercises short, this environment takes shortcuts you should not reproduce in production:
-
-* Tokens are obtained with `oc login -u <user> -p <password>` from the command line, and pasted into the client as environment variables.
-* TLS is terminated at the OpenShift router, and in-cluster calls to Prometheus skip certificate verification.
-* `mcp-admin` is bound to `cluster-admin` to keep the write exercises simple; real users should get the narrowest role that fits their task.
-====
