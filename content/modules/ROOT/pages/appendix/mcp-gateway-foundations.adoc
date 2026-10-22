@@ -1,0 +1,227 @@
+= Appendix - Technical Foundations: MCP Gateway
+
+include::partial$_attributes.adoc[]
+
+:page-toclevels: 2
+
+This appendix explains how the MCP Gateway environment is built, and above all how access control works: who is allowed to call which MCP tool, and which component makes that decision. Read it after (or alongside) the xref:module-03-mcp-gateway.adoc[MCP Gateway] module if you want to understand what happens behind each exercise.
+
+Everything described here is deployed by OpenShift GitOps (Argo CD) from Helm charts in the lab repository, under `automation/gitops/`.
+
+== In One Sentence
+
+The gateway validates a Keycloak JWT on every request, and authorizes each tool call by checking that the token carries a Keycloak role named after that tool — *the backend MCP servers contain no security logic at all*.
+
+== How This Differs from the MCP Server Module
+
+[cols="1,2,2",options="header"]
+|===
+|
+|xref:appendix/mcp-server-foundations.adoc[MCP Server]
+|MCP Gateway
+
+|Who makes the decision
+|The *Kubernetes API server*, using standard OpenShift RBAC
+|The *gateway* (Envoy + Authorino), evaluating a CEL expression on a JWT
+
+|Token presented by the client
+|An *OpenShift OAuth token* (`oc whoami -t`)
+|A *Keycloak access token* (JWT), issued directly by Keycloak
+
+|Role of Keycloak
+|Identity store only — OpenShift OAuth uses it as its identity provider
+|Token issuer, *and* the place where tool permissions are defined (groups and client roles)
+
+|Granularity
+|Kubernetes verb + resource (+ namespace)
+|Individual MCP tool
+
+|Where permissions are configured
+|`ClusterRoleBinding` / `RoleBinding` objects
+|Keycloak groups and client roles, plus an `AuthPolicy`
+|===
+
+== Building Blocks
+
+=== Keycloak
+
+Red Hat Build of Keycloak runs in the `keycloak` namespace with a realm named `keycloak`. It is provided by the base environment. The setup Job `keycloak-mcp-setup` reads the Keycloak admin credentials from the `keycloak-initial-admin` secret and builds the authorization model through the Keycloak admin REST API (see <<The Authorization Model in Keycloak>>).
+
+=== The `mcp-cli` Pod
+
+The `mcp-cli` pod in the `mcp-cli` namespace runs https://opencode.ai[opencode^], pre-configured with the lab LLM and with the gateway:
+
+[source,json]
+----
+"mcp-gateway": {
+  "type": "remote",
+  "url": "https://mcp-gateway.<cluster-domain>/mcp",
+  "headers": { "Authorization": "Bearer {env:GATEWAY_MCP_TOKEN}" }
+}
+----
+
+opencode resolves `{env:GATEWAY_MCP_TOKEN}` when it starts, so you choose the user by exporting that user's Keycloak token before starting opencode.
+
+NOTE: The OpenShift MCP Server from the previous module is *not* behind this gateway. The two are separate endpoints, each with its own authentication model.
+
+=== Platform Side
+
+Resources in the `mcp-gateway` and `openshift-ingress` namespaces:
+
+* *MCP Gateway operator* (Red Hat Connectivity Link), installed through OLM.
+* *`Kuadrant` CR* — activates the policy engines: *Authorino* (authentication and authorization) and *Limitador* (rate limiting). It also sends traces to Jaeger.
+* *`Gateway`* `mcp-gateway` in `openshift-ingress`, implemented by Envoy through the `openshift-default` GatewayClass. It has two listeners:
+** `mcp` — hostname `mcp-gateway.<cluster-domain>`, the public entry point, exposed through an edge-terminated Route.
+** `mcps` — hostname `*.mcp.internal`, used internally to route traffic from the gateway to each backend MCP server.
+* *`ReferenceGrant`* — allows resources in the `mock-mcp-servers` namespace to attach to the Gateway in `openshift-ingress`.
+* *`AuthPolicy`* `mcp-tool-auth-policy` on the `mcps` listener — the per-tool authorization check.
+
+=== Tenant Side
+
+Resources in the `mock-mcp-servers` namespace:
+
+* *Three mock MCP servers* — `inventory`, `payments` and `accounts`, each a FastMCP server with 5 tools, a Service, and an `HTTPRoute` on `<name>.mcp.internal`.
+* *`MCPServerRegistration`* per server, with `prefix: "<name>_"`. This tells the broker to federate the server's tools under prefixed names, such as `inventory_list_products`.
+* *`MCPGatewayExtension`* — attaches the MCP *broker* (the MCP-aware router) to the `mcp` listener. It also publishes OAuth protected resource metadata, so MCP clients can discover that Keycloak is the authorization server.
+* *`AuthPolicy`* `mcp-gateway-auth` on the broker route `mcp-gateway-route` — requires a valid Keycloak JWT.
+* *`RateLimitPolicy`* `mcp-gateway-ratelimit` — 30 requests per minute, counted per JWT `sub` claim (Exercise 5).
+* *Jaeger* — receives OpenTelemetry traces from the gateway and the broker.
+
+== The Authorization Model in Keycloak
+
+The setup Job models "which user can call which tool" entirely with standard Keycloak concepts:
+
+----
+Client  mcp-gateway                  confidential client, used to obtain tokens
+
+Client  mock-mcp-servers/inventory   roles: tool:list_products, tool:get_product, ...
+Client  mock-mcp-servers/payments    roles: tool:list_transactions, tool:process_refund, ...
+Client  mock-mcp-servers/accounts    roles: tool:list_accounts, tool:get_account, ...
+        (one client per MCPServerRegistration, named <namespace>/<name>)
+
+Group   team-a   ◀── user1   gets all roles of inventory + accounts
+Group   team-b   ◀── user2   gets all roles of payments
+----
+
+* Each *backend MCP server* is represented by a Keycloak *client*.
+* Each *tool* is a *client role* named `tool:<tool-name>`, using the tool's unprefixed name.
+* *Groups* receive client roles, and *users* inherit them through group membership.
+
+A `roles` client scope with a client role mapper writes these roles into the access token under the `resource_access` claim. A token issued to `user1` contains:
+
+[source,json]
+----
+"resource_access": {
+  "mock-mcp-servers/inventory": { "roles": ["tool:list_products", "tool:get_product", "..."] },
+  "mock-mcp-servers/accounts":  { "roles": ["tool:list_accounts", "tool:get_account", "..."] }
+}
+----
+
+The `basic` scope is also added so the token contains the `sub` claim used for per-user rate limiting, and the realm's access token lifespan is set to 8 hours.
+
+== Request Flow
+
+----
+curl .../token (client mcp-gateway, user1) ──▶ Keycloak ──▶ JWT with resource_access
+
+client ──▶ Route ──▶ Gateway listener "mcp" ──▶ broker
+              │  AuthPolicy mcp-gateway-auth:  valid JWT for the realm?   no ──▶ 401
+              │  RateLimitPolicy:              under 30 req/min for sub?  no ──▶ 429
+              ▼
+           Broker
+              │  tools/list  ──▶ federated list of all 17 tools
+              │  tools/call inventory_list_products
+              │     strips the prefix, forwards to inventory.mcp.internal
+              │     with headers  x-mcp-servername: mock-mcp-servers/inventory
+              │                   x-mcp-toolname:   list_products
+              ▼
+           Gateway listener "mcps"
+              │  AuthPolicy mcp-tool-auth-policy (CEL):
+              │    "tool:" + x-mcp-toolname  in  resource_access[x-mcp-servername].roles ?
+              ▼
+           yes ──▶ inventory MCP server          no ──▶ 403 "Insufficient permissions for this tool"
+----
+
+The tool-level rule only applies when the `x-mcp-toolname` header is present, that is, on tool calls. Protocol traffic such as `initialize` and `tools/list` only requires a valid token — which is why `user1` sees all 17 tools in Exercise 3, but cannot call the payments tools in Exercise 4.
+
+The authorization check itself is a single CEL expression in the `AuthPolicy`:
+
+[source,yaml]
+----
+authorization:
+  tool-access-check:
+    when:
+      - predicate: "request.headers.exists(h, h == 'x-mcp-toolname')"
+    patternMatching:
+      patterns:
+        - predicate: |
+            ('tool:' + request.headers['x-mcp-toolname']) in
+              (has(auth.identity.resource_access) &&
+               auth.identity.resource_access.exists(p, p == request.headers['x-mcp-servername'])
+                 ? auth.identity.resource_access[request.headers['x-mcp-servername']].roles
+                 : [])
+----
+
+The backend MCP servers contain no authentication or authorization logic at all — everything is enforced by Envoy and Authorino in front of them.
+
+== How to Control Who Can Do What
+
+* *Give a team access to a whole server* — map all of that server's client roles to the team's group.
+* *Give access to a single tool* — assign only the corresponding `tool:<name>` client role, to a group or directly to a user, in the Keycloak admin console.
+* *Add a new MCP server* — create an `HTTPRoute` and `MCPServerRegistration` for it, a Keycloak client named `<namespace>/<registration-name>`, one `tool:<name>` client role per tool, and the group mappings. No change is needed in the `AuthPolicy`.
+
+Changes take effect on the next token: a user must request a new access token to receive updated roles.
+
+== Inspect It Yourself
+
+These commands use the `USER1_TOKEN` variable created at the beginning of the MCP Gateway module.
+
+. Decode the payload of `user1`'s JWT and look at the claims the gateway relies on:
++
+[source,sh,role=execute]
+----
+echo "$USER1_TOKEN" | jq -R 'split(".")[1] | gsub("-";"+") | gsub("_";"/")
+  | . + ("=" * ((4 - length % 4) % 4)) | @base64d | fromjson
+  | {preferred_username, sub, resource_access}'
+----
+
+. List the MCP-related policies and where they are attached:
++
+[source,sh,role=execute]
+----
+oc get authpolicy,ratelimitpolicy -A
+----
+
+. View the tool-level authorization rule:
++
+[source,sh,role=execute]
+----
+oc get authpolicy mcp-tool-auth-policy -n openshift-ingress -o jsonpath='{.spec.rules.authorization}' | jq
+----
+
+. View the federated servers and their tool prefixes:
++
+[source,sh,role=execute]
+----
+oc get mcpserverregistration -n mock-mcp-servers \
+  -o custom-columns=NAME:.metadata.name,PREFIX:.spec.prefix,ROUTE:.spec.targetRef.name
+----
+
+== Key Points to Remember
+
+* *Authentication and authorization are moved out of the MCP servers* and into the gateway, so every server behind it gets the same security model for free.
+* *Permissions are data in Keycloak*, not code: one client per server, one role per tool, groups per team.
+* *Tool discovery is not filtered per user.* Authorization is enforced when a tool is *called*.
+* *This token is not interchangeable* with the one used in the MCP Server module: the gateway expects a Keycloak JWT that it validates against the realm's issuer.
+* *Gateway authorization and Kubernetes RBAC are complementary.* The gateway answers "may this user call this tool?", while RBAC answers "may this user perform this operation on the cluster?". Placing an MCP server that uses token passthrough behind the gateway would combine both checks — this lab demonstrates each layer separately.
+
+[NOTE]
+.Lab simplifications
+====
+To keep the exercises short, this environment takes shortcuts you should not reproduce in production:
+
+* The `mcp-gateway` client secret and the `user1` / `user2` passwords are fixed values in the Helm chart.
+* Tokens are obtained with the OAuth password grant from the command line, rather than the authorization code flow in a browser.
+* TLS is terminated at the OpenShift router, and in-cluster calls to Keycloak skip certificate verification.
+* Access tokens are valid for 8 hours.
+====

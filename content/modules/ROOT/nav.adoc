@@ -2,3 +2,7 @@
 * xref:module-01-agentic-troubleshooting.adoc[Agentic Troubleshooting]
 * xref:module-02-mcp-server.adoc[MCP Server]
 * xref:module-03-mcp-gateway.adoc[MCP Gateway]
+* Appendix - Technical Foundations
+** xref:appendix/agentic-troubleshooting-foundations.adoc[Agentic Troubleshooting]
+** xref:appendix/mcp-server-foundations.adoc[MCP Server]
+** xref:appendix/mcp-gateway-foundations.adoc[MCP Gateway]
