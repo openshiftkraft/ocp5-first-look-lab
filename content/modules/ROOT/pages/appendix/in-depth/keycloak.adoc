@@ -1,0 +1,567 @@
+= In Depth: Red Hat Build of Keycloak
+
+include::partial$_attributes.adoc[]
+
+:page-toclevels: 3
+
+This page explains how Red Hat Build of Keycloak (RHBK) is installed in this environment, how its realm is built, and how OpenShift, the OpenShift MCP Server and the MCP Gateway each use it. It is written for engineers who want to reproduce the setup on a fresh cluster.
+
+== What Keycloak Does Here
+
+Keycloak is the *single identity provider* of the environment. It plays three distinct roles:
+
+[cols="1,2,2",options="header"]
+|===
+|Consumer
+|How it uses Keycloak
+|Token the end client finally holds
+
+|*OpenShift OAuth server*
+|Keycloak is an `OpenID` identity provider in the cluster `OAuth` configuration. Users log in to the console or `oc` with their Keycloak credentials.
+|An *OpenShift OAuth access token* (`sha256~...`), issued by OpenShift, not by Keycloak
+
+|*OpenShift MCP Server*
+|Indirectly: the MCP server forwards OpenShift OAuth tokens to the Kubernetes API. Keycloak only stores the `mcp-admin` and `mcp-viewer` users.
+|OpenShift OAuth access token
+
+|*MCP Gateway*
+|Directly: the gateway's `AuthPolicy` validates *Keycloak-issued JWTs* against the realm issuer, and authorizes tool calls from client roles carried in the token.
+|A *Keycloak access token* (JWT, RS256)
+|===
+
+== Architecture
+
+----
+namespace keycloak
+│
+├─ rhbk-operator ── reconciles ──▶ Keycloak CR, KeycloakRealmImport CR
+│
+├─ StatefulSet keycloak ── JDBC ──▶ Deployment keycloak-pgsql (+ PVC)
+│     Service keycloak :8443   (serving certificate keycloak-tls)
+│
+└─ Route sso.<domain>  (reencrypt)
+      ▲
+      ├── OpenShift OAuth server   OIDC login (auth code, password grant)
+      ├── Argo CD setup Jobs       admin REST API (clients, roles, users)
+      ├── Authorino (gateway)      OIDC discovery + JWKS, JWT validation
+      └── MCP clients              token requests (password grant)
+----
+
+== Installation on a Fresh Cluster
+
+The following steps reproduce what the `ocp4_workload_authentication` role does. Replace `<cluster-domain>` with your ingress domain (`oc get ingresses.config cluster -o jsonpath='{.spec.domain}'`).
+
+=== Step 1: Install the RHBK Operator
+
+[source,yaml]
+----
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: keycloak
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  targetNamespaces:          # <1>
+    - keycloak
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: rhbk-operator
+  namespace: keycloak
+spec:
+  name: rhbk-operator        # <2>
+  channel: stable-v26.2      # <3>
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Automatic
+----
+<1> The RHBK operator only supports `OwnNamespace` / `SingleNamespace` install modes: it watches the namespace where the `Keycloak` CR lives.
+<2> OLM package name.
+<3> Each RHBK minor release has its own channel. Check what your catalog offers with `oc get packagemanifest rhbk-operator -n openshift-marketplace -o jsonpath='{.status.channels[*].name}'`.
+
+=== Step 2: Provide a PostgreSQL Database
+
+RHBK does not ship a database. The role deploys a single PostgreSQL 16 instance in the same namespace:
+
+[source,yaml]
+----
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keycloak-pgsql-user
+  namespace: keycloak
+stringData:
+  user: keycloak
+  password: <random-password>
+  dbname: keycloak
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: keycloak-pgsql-data
+  namespace: keycloak
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak-pgsql
+  namespace: keycloak
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: keycloak-pgsql}
+  template:
+    metadata:
+      labels: {app: keycloak-pgsql}
+    spec:
+      containers:
+        - name: pgsql
+          image: registry.redhat.io/rhel9/postgresql-16
+          env:
+            - {name: POSTGRESQL_USER,     valueFrom: {secretKeyRef: {name: keycloak-pgsql-user, key: user}}}
+            - {name: POSTGRESQL_PASSWORD, valueFrom: {secretKeyRef: {name: keycloak-pgsql-user, key: password}}}
+            - {name: POSTGRESQL_DATABASE, valueFrom: {secretKeyRef: {name: keycloak-pgsql-user, key: dbname}}}
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: pgsql-storage
+              mountPath: /var/lib/pgsql/data
+      volumes:
+        - name: pgsql-storage
+          persistentVolumeClaim:
+            claimName: keycloak-pgsql-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-pgsql
+  namespace: keycloak
+spec:
+  selector: {app: keycloak-pgsql}
+  ports:
+    - port: 5432
+      targetPort: 5432
+----
+
+For production, use a highly available database (for example an operator-managed PostgreSQL cluster) instead of a single pod.
+
+=== Step 3: Create the Keycloak Instance
+
+The role creates the Service *before* the `Keycloak` CR so that the OpenShift service CA can issue the `keycloak-tls` serving certificate that Keycloak needs to start with HTTPS only.
+
+[source,yaml]
+----
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  namespace: keycloak
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: keycloak-tls   # <1>
+spec:
+  selector:
+    app: keycloak
+    app.kubernetes.io/instance: keycloak
+    app.kubernetes.io/managed-by: keycloak-operator
+  ports:
+    - {name: https, port: 8443, targetPort: 8443}
+    - {name: http,  port: 8080, targetPort: 8080}
+---
+apiVersion: k8s.keycloak.org/v2alpha1
+kind: Keycloak
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  instances: 1                                   # <2>
+  db:
+    vendor: postgres
+    host: keycloak-pgsql                         # <3>
+    database: keycloak
+    usernameSecret: {name: keycloak-pgsql-user, key: user}
+    passwordSecret: {name: keycloak-pgsql-user, key: password}
+  hostname:
+    hostname: sso.<cluster-domain>               # <4>
+    strict: false                                # <5>
+    strictBackchannel: false
+  http:
+    httpEnabled: false                           # <6>
+    tlsSecret: keycloak-tls
+  ingress:
+    enabled: false                               # <7>
+  transaction:
+    xaEnabled: true
+  additionalOptions:
+    - name: enable-recovery
+      value: 'true'
+----
+<1> The service CA generates a certificate for `keycloak.keycloak.svc` into the `keycloak-tls` secret.
+<2> Keycloak runs as a StatefulSet; raise `instances` for high availability (sessions are replicated through the embedded Infinispan cache).
+<3> The PostgreSQL Service from step 2.
+<4> The public hostname. It becomes the `iss` (issuer) of every token: `https://sso.<cluster-domain>/realms/<realm>`. Every consumer validating JWTs must use exactly this URL.
+<5> With `strict: false`, Keycloak also answers on other hostnames, such as the internal Service name `keycloak.keycloak.svc:8443` used by the lab's setup Jobs.
+<6> HTTPS only, using the serving certificate.
+<7> The operator's own ingress is disabled; the role creates an explicit Route instead (next step).
+
+When the instance starts, the operator creates the `keycloak-initial-admin` secret (keys `username` and `password`) holding the bootstrap administrator of the `master` realm. All setup Jobs in this lab read it.
+
+=== Step 4: Expose Keycloak
+
+[source,yaml]
+----
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  host: sso.<cluster-domain>
+  to:
+    kind: Service
+    name: keycloak
+  port:
+    targetPort: https
+  tls:
+    termination: reencrypt                 # <1>
+    insecureEdgeTerminationPolicy: Redirect
+----
+<1> The router terminates TLS with the cluster's ingress certificate, then re-encrypts to Keycloak's service-CA certificate. Clients see a publicly trusted certificate (when the ingress certificate is), which matters for OpenShift OAuth and Authorino, which both fetch the issuer's discovery document over HTTPS.
+
+=== Step 5: Import the Realm
+
+The realm is created declaratively with a `KeycloakRealmImport`. This is the role's template, rendered with the values used in this lab (realm `keycloak`):
+
+[source,yaml]
+----
+apiVersion: k8s.keycloak.org/v2alpha1
+kind: KeycloakRealmImport
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  keycloakCRName: keycloak                 # <1>
+  realm:
+    id: keycloak
+    realm: keycloak                        # <2>
+    enabled: true
+    sslRequired: external
+    registrationAllowed: false
+    loginWithEmailAllowed: true
+    duplicateEmailsAllowed: false
+    clients:
+      - clientId: idp-4-ocp                # <3>
+        enabled: true
+        clientAuthenticatorType: client-secret
+        secret: <openshift-client-secret>
+        publicClient: false
+        redirectUris: ["*"]                # <4>
+        standardFlowEnabled: true          # <5>
+        directAccessGrantsEnabled: true    # <6>
+        serviceAccountsEnabled: true
+        frontchannelLogout: false
+        protocol: openid-connect
+    roles:
+      realm:
+        - name: user
+        - name: admin
+    users:                                 # <7>
+      - username: admin
+        enabled: true
+        emailVerified: true
+        email: admin@demo.redhat.com
+        credentials:
+          - {type: password, value: <password>, temporary: false}
+        realmRoles: [admin]
+        groups: [/admins]
+    groups:
+      - name: admins
+      - name: users
+----
+<1> The `Keycloak` CR to import into.
+<2> The AgnosticD role's default realm name is `sso`; this environment sets it to `keycloak`, which is why every URL in the lab contains `/realms/keycloak`.
+<3> The confidential client used by the OpenShift OAuth server.
+<4> Accepts any redirect URI. In production, restrict it to `https://oauth-openshift.apps.<cluster-domain>/oauth2callback/rhbk`.
+<5> Authorization code flow: used when users log in through the web console.
+<6> Resource owner password credentials grant: required for `oc login -u <user> -p <password>`, where the OpenShift OAuth server exchanges the password with Keycloak on the user's behalf.
+<7> Cluster accounts and lab users created by the role (the list depends on the catalog item).
+
+[IMPORTANT]
+====
+A `KeycloakRealmImport` is a *one-shot* operation: the operator imports the realm once and does not reconcile later changes. Anything that must change after the import (display name, extra clients, roles, users, token lifespans) has to go through the Keycloak admin REST API or the admin console. This is exactly why the lab uses Jobs for its own realm content.
+====
+
+=== Step 6: Register Keycloak as an OpenShift Identity Provider
+
+[source,yaml]
+----
+apiVersion: v1
+kind: Secret
+metadata:
+  name: openid-client-secret-bb6zw
+  namespace: openshift-config            # <1>
+type: Opaque
+stringData:
+  clientSecret: <openshift-client-secret>
+---
+apiVersion: config.openshift.io/v1
+kind: OAuth
+metadata:
+  name: cluster
+spec:
+  identityProviders:
+    - name: rhbk                          # <2>
+      type: OpenID
+      mappingMethod: claim                # <3>
+      openID:
+        issuer: https://sso.<cluster-domain>/realms/keycloak   # <4>
+        clientID: idp-4-ocp
+        clientSecret:
+          name: openid-client-secret-bb6zw
+        claims:
+          preferredUsername: [preferred_username]               # <5>
+          name: [name]
+          email: [email]
+        extraScopes: []
+----
+<1> Identity provider secrets must live in `openshift-config`.
+<2> The provider name, shown on the login page and stored in each `Identity` object (`rhbk:<user-id>`).
+<3> `claim`: the OpenShift `User` name is taken from the claim, and a login fails if a user of that name already exists from another provider.
+<4> Must match the token issuer exactly (scheme, host, realm path).
+<5> The OpenShift user name is the Keycloak `preferred_username`. This is what makes RBAC by name work: a `ClusterRoleBinding` to `User mcp-viewer` applies to the Keycloak user `mcp-viewer`, even before their first login.
+
+The authentication operator rolls out new `oauth-openshift` pods after this change; wait for `oc get co authentication` to report `Progressing=False`.
+
+== The Realm as Configured in This Lab
+
+After the role's import, three Argo CD hook Jobs extend the realm through the admin REST API. All of them authenticate the same way:
+
+[source,sh]
+----
+ADMIN_USER=$(oc get secret keycloak-initial-admin -n keycloak -o jsonpath='{.data.username}' | base64 -d)
+ADMIN_PASS=$(oc get secret keycloak-initial-admin -n keycloak -o jsonpath='{.data.password}' | base64 -d)
+ADMIN_TOKEN=$(curl -sk -X POST "https://sso.<cluster-domain>/realms/master/protocol/openid-connect/token" \
+  -d "grant_type=password&client_id=admin-cli&username=${ADMIN_USER}&password=${ADMIN_PASS}" | jq -r .access_token)
+----
+
+Each Job's service account is granted `get` on that single secret through a `Role` in the `keycloak` namespace restricted with `resourceNames: [keycloak-initial-admin]`.
+
+=== Realm Display Name
+
+Job `keycloak-realm-displayname` (app-of-apps chart) sets the login page title with `PUT /admin/realms/keycloak` and `{"displayName": "Red Hat OpenShift 5 Early Access"}`, because the role cannot set it and the realm import is not re-reconciled.
+
+=== Users for the OpenShift MCP Server
+
+Job `mcp-server-keycloak-setup` (`openshift-mcp-server` chart) creates two plain users, with no client roles and no groups:
+
+[cols="1,1,3",options="header"]
+|===
+|User
+|Password
+|What gives them permissions
+
+|`mcp-admin`
+|Random, stored in secret `openshift-mcp/mcp-user-credentials`
+|`ClusterRoleBinding mcp-server-mcp-admin` → `cluster-admin`
+
+|`mcp-viewer`
+|Random, stored in the same secret
+|`ClusterRoleBinding mcp-server-mcp-viewer` → `view`
+|===
+
+The Job is idempotent: it reuses existing passwords from the secret, creates missing users with `POST /admin/realms/keycloak/users`, and resets the password of existing users with `PUT .../users/<id>/reset-password`. Authorization happens entirely in Kubernetes RBAC; Keycloak only authenticates.
+
+=== Clients, Roles and Groups for the MCP Gateway
+
+Job `keycloak-mcp-setup` (`mcp-gateway` chart) builds a *tool-level authorization model* inside the realm. The model is driven by the chart values:
+
+[source,yaml]
+----
+keycloak:
+  realm: keycloak
+  clientId: mcp-gateway
+  clientSecret: mcp-gateway-secret
+  serverNamespace: mock-mcp-servers
+  servers:                               # <1>
+    - name: inventory
+      tools: [list_products, get_product, check_stock_alerts, update_quantity, search_products]
+    - name: payments
+      tools: [list_transactions, get_transaction, process_refund, get_daily_summary, check_payment_status]
+    - name: accounts
+      tools: [list_accounts, get_account, get_account_history, update_credit_limit, check_credit_available]
+  groups:                                # <2>
+    - name: team-a
+      servers: [inventory, accounts]
+    - name: team-b
+      servers: [payments]
+  users:                                 # <3>
+    - {username: user1, password: user1pass, group: team-a, email: user1@example.com}
+    - {username: user2, password: user2pass, group: team-b, email: user2@example.com}
+----
+<1> One entry per MCP server registered in the gateway, with the *unprefixed* names of its tools.
+<2> Teams, and the servers whose tools they may call.
+<3> Test users and their team.
+
+From these values the Job performs the following, in order:
+
+. *Raises the access token lifespan* of the realm to 8 hours: `PUT /admin/realms/keycloak` with `{"accessTokenLifespan": 28800}`.
+. *Creates the `mcp-gateway` client*: confidential, secret `mcp-gateway-secret`, `directAccessGrantsEnabled: true` (password grant for the exercises), `standardFlowEnabled: true`, `fullScopeAllowed: true`.
+. *Ensures a `roles` client scope* exists, with two protocol mappers:
+** `oidc-usermodel-client-role-mapper` writing *all of the user's client roles* to the claim `resource_access.${client_id}.roles` in the access token;
+** `oidc-audience-resolve-mapper`, adding to `aud` every client for which the user has a role.
+. *Adds `roles` and `basic` as default client scopes* of `mcp-gateway`. `basic` provides the `sub` claim, used as the rate limiting key.
+. *Creates one public client per MCP server*, named `<serverNamespace>/<server>` (for example `mock-mcp-servers/inventory`), with `fullScopeAllowed: false` and no flows enabled. These clients are never used to log in; they only act as *containers for roles*.
+. *Creates one client role per tool* on each server client: `tool:list_products`, `tool:get_product`, and so on.
+. *Creates the groups* and maps *all* client roles of each listed server to the group (`POST /groups/<id>/role-mappings/clients/<client-id>`).
+. *Creates the users* with a non-temporary password and adds each to its group.
+
+The resulting realm model:
+
+----
+realm keycloak
+├── client idp-4-ocp                   OpenShift OAuth
+├── client mcp-gateway                 token client (scopes: roles, basic)
+├── client mock-mcp-servers/inventory  roles tool:list_products, ...
+├── client mock-mcp-servers/payments   roles tool:list_transactions, ...
+├── client mock-mcp-servers/accounts   roles tool:list_accounts, ...
+├── group team-a   all inventory + accounts roles   members: user1
+├── group team-b   all payments roles               members: user2
+└── users          admin, mcp-admin, mcp-viewer, user1, user2
+----
+
+[IMPORTANT]
+====
+The client ID of each server client *must equal* the value the MCP Gateway puts in the `x-mcp-servername` header, which is `<namespace>/<name>` of the `MCPServerRegistration`. The tool-level `AuthPolicy` uses that header to index `resource_access`. If you rename a registration or move it to another namespace, rename the Keycloak client accordingly. See xref:appendix/in-depth/mcp-gateway.adoc[In Depth: MCP Gateway].
+====
+
+== Tokens in Detail
+
+=== OpenShift Login (MCP Server Module)
+
+----
+oc login -u mcp-viewer -p <password>
+  │
+  ▼
+oauth-openshift ── password grant (client idp-4-ocp) ──▶ Keycloak
+  │                                                        │
+  │◀───── ID token: preferred_username=mcp-viewer ─────────┘
+  ▼
+User "mcp-viewer" + Identity "rhbk:<keycloak-user-id>" created or updated
+  │
+  ▼
+OpenShift OAuth access token sha256~...   (opaque, checked by kube-apiserver)
+----
+
+The Keycloak token never leaves the OAuth server. The client receives an opaque OpenShift token, which is why the OpenShift MCP Server runs with `skip_jwt_verification = true`: there is no JWT to verify, and the Kubernetes API server is the authority.
+
+=== Gateway Token (MCP Gateway Module)
+
+[source,sh]
+----
+curl -sk "https://sso.<cluster-domain>/realms/keycloak/protocol/openid-connect/token" \
+  -d grant_type=password \
+  -d client_id=mcp-gateway -d client_secret=mcp-gateway-secret \
+  -d username=user1 -d password=user1pass | jq -r .access_token
+----
+
+Decoded payload of the resulting access token (abridged, with comments added for explanation):
+
+[source,json]
+----
+{
+  "iss": "https://sso.<cluster-domain>/realms/keycloak",       // validated by Authorino
+  "sub": "4b2f...-...",                                         // rate limiting counter key
+  "azp": "mcp-gateway",
+  "aud": ["mock-mcp-servers/inventory", "mock-mcp-servers/accounts", "account"],
+  "exp": 1793000000,                                            // iat + 8 hours
+  "preferred_username": "user1",
+  "resource_access": {                                          // tool authorization data
+    "mock-mcp-servers/inventory": { "roles": ["tool:list_products", "tool:get_product", "tool:check_stock_alerts", "tool:update_quantity", "tool:search_products"] },
+    "mock-mcp-servers/accounts":  { "roles": ["tool:list_accounts", "tool:get_account", "tool:get_account_history", "tool:update_credit_limit", "tool:check_credit_available"] }
+  }
+}
+----
+
+The gateway validates the signature with the realm's public keys, discovered from `https://sso.<cluster-domain>/realms/keycloak/.well-known/openid-configuration` (`jwks_uri`). No shared secret is configured in the gateway.
+
+== Reproducing the Lab Realm Content
+
+To reproduce the MCP-specific realm content on a fresh Keycloak without the Helm charts, the equivalent admin API calls are:
+
+[source,sh]
+----
+KC="https://sso.<cluster-domain>/admin/realms/keycloak"
+H=(-H "Authorization: Bearer ${ADMIN_TOKEN}" -H "Content-Type: application/json")
+
+# 1. Token client used by MCP clients
+curl -sk -X POST "$KC/clients" "${H[@]}" -d '{
+  "clientId":"mcp-gateway","publicClient":false,"secret":"<secret>",
+  "directAccessGrantsEnabled":true,"standardFlowEnabled":true,"fullScopeAllowed":true,
+  "protocol":"openid-connect","defaultClientScopes":["roles","basic"]}'
+
+# 2. One role-container client per MCP server, one role per tool
+curl -sk -X POST "$KC/clients" "${H[@]}" -d '{
+  "clientId":"mock-mcp-servers/inventory","publicClient":true,
+  "directAccessGrantsEnabled":false,"fullScopeAllowed":false,"protocol":"openid-connect"}'
+INV=$(curl -sk "$KC/clients?clientId=mock-mcp-servers/inventory" "${H[@]}" | jq -r '.[0].id')
+for t in list_products get_product check_stock_alerts update_quantity search_products; do
+  curl -sk -X POST "$KC/clients/$INV/roles" "${H[@]}" -d "{\"name\":\"tool:$t\"}"
+done
+
+# 3. Group with all roles of that server, and a member
+curl -sk -X POST "$KC/groups" "${H[@]}" -d '{"name":"team-a"}'
+GA=$(curl -sk "$KC/groups?search=team-a&exact=true" "${H[@]}" | jq -r '.[0].id')
+curl -sk -X POST "$KC/groups/$GA/role-mappings/clients/$INV" "${H[@]}" \
+  -d "$(curl -sk "$KC/clients/$INV/roles" "${H[@]}")"
+curl -sk -X POST "$KC/users" "${H[@]}" -d '{"username":"user1","enabled":true,"emailVerified":true,
+  "email":"user1@example.com","credentials":[{"type":"password","value":"<pw>","temporary":false}]}'
+U1=$(curl -sk "$KC/users?username=user1&exact=true" "${H[@]}" | jq -r '.[0].id')
+curl -sk -X PUT "$KC/users/$U1/groups/$GA" "${H[@]}"
+----
+
+The `roles` client scope with the client role mapper exists by default in new Keycloak realms; the lab Job only creates it if it is missing.
+
+== Operating and Troubleshooting
+
+[cols="2,3",options="header"]
+|===
+|Task
+|Command
+
+|Check the operator and the instance
+|`oc get csv -n keycloak; oc get keycloak keycloak -n keycloak -o jsonpath='{.status.conditions}' \| jq`
+
+|Check the realm import
+|`oc get keycloakrealmimport -n keycloak -o jsonpath='{.items[*].status.conditions}' \| jq`
+
+|Read the issuer and keys
+|`curl -sk https://sso.<cluster-domain>/realms/keycloak/.well-known/openid-configuration \| jq '{issuer, token_endpoint, jwks_uri}'`
+
+|Check the OpenShift identity provider
+|`oc get oauth cluster -o jsonpath='{.spec.identityProviders}' \| jq; oc get co authentication`
+
+|See which OpenShift users came from Keycloak
+|`oc get identities \| grep rhbk`
+
+|Re-run a lab setup Job
+|Sync the owning Argo CD application (`openshift-mcp-server` or `mcp-gateway`); the Jobs are `Sync` hooks with `BeforeHookCreation` delete policy
+
+|Inspect a user's effective tool roles
+|Decode their access token: `jq -R 'split(".")[1] \| gsub("-";"+") \| gsub("_";"/") \| . + ("=" * ((4 - length % 4) % 4)) \| @base64d \| fromjson \| .resource_access'`
+|===
+
+Common problems:
+
+* *`oc login` fails with "invalid_grant" or "unauthorized_client"* — the `idp-4-ocp` client has `directAccessGrantsEnabled: false`, or the client secret in `openshift-config` does not match the client.
+* *Gateway returns 401 for a fresh token* — the token's `iss` claim differs from the `issuerUrl` in the `AuthPolicy` (another realm, or another host). Decode the token and compare `iss` with the `issuer` returned by the realm's discovery document; request gateway tokens through the public `sso.<cluster-domain>` URL.
+* *Gateway returns 403 for a tool the user should have* — the token predates the role change (tokens are valid 8 hours), the server client name does not match `<namespace>/<registration>`, or the role name does not match the unprefixed tool name.

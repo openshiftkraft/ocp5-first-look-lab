@@ -6,3 +6,8 @@
 ** xref:appendix/agentic-troubleshooting-foundations.adoc[Agentic Troubleshooting]
 ** xref:appendix/mcp-server-foundations.adoc[MCP Server]
 ** xref:appendix/mcp-gateway-foundations.adoc[MCP Gateway]
+** In Depth
+*** xref:appendix/in-depth/openshift-lightspeed.adoc[OpenShift Lightspeed]
+*** xref:appendix/in-depth/openshift-mcp-server.adoc[OpenShift MCP Server]
+*** xref:appendix/in-depth/mcp-gateway.adoc[MCP Gateway]
+*** xref:appendix/in-depth/keycloak.adoc[Keycloak]

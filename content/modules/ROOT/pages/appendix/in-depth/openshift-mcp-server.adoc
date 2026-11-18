@@ -1,0 +1,434 @@
+= In Depth: OpenShift MCP Server
+
+include::partial$_attributes.adoc[]
+
+:page-toclevels: 3
+
+This page explains what the OpenShift MCP Server is, how it is deployed and configured in this environment, how it authenticates callers, and how OpenShift Lightspeed, the agentic operator and command-line MCP clients connect to it. It is written for engineers who want to reproduce the setup on a fresh cluster.
+
+== What It Does
+
+The *Model Context Protocol* (MCP) lets an AI application discover and call *tools* exposed by a server. The OpenShift MCP Server exposes the OpenShift and Kubernetes APIs as MCP tools: listing pods, reading logs, applying resources, querying Prometheus, inspecting the service mesh, and so on. An LLM never talks to the Kubernetes API itself; it asks its client (opencode, Lightspeed, an agent) to call a tool, and the MCP server performs the API calls.
+
+The server is *stateless with regard to identity*: in the configuration used here, it forwards the caller's bearer token to the Kubernetes API, so every tool call is authorized by the cluster's RBAC for that caller.
+
+== Architecture
+
+----
+opencode (mcp-cli pod)
+  │ HTTPS   Authorization: Bearer <OpenShift token>
+  ▼
+Route mcp-server.<domain> (edge) ──┐
+                                   ▼
+OpenShift Lightspeed ── HTTP ──▶ Service openshift-mcp-server:8080
+  kubernetes-authorization:        │
+  <console user token>             ▼
+               Deployment openshift-mcp-server   (namespace openshift-mcp)
+               config: ConfigMap mcp-config ─▶ /etc/mcp/config.toml
+                  │
+                  ├─▶ kube-apiserver   with the caller's token
+                  ├─▶ Thanos querier   with the caller's token (metrics)
+                  └─▶ Kiali            (ossm toolset)
+----
+
+== Tools and Toolsets
+
+Tools are grouped in *toolsets*. This environment enables:
+
+[cols="1,4",options="header"]
+|===
+|Toolset
+|Examples of tools
+
+|`core`
+|Generic resources (`resources_list`, `resources_get`, `resources_create_or_update`, `resources_delete`), pods (`pods_list`, `pods_get`, `pods_log`, `pods_exec`, `pods_run`, `pods_delete`, `pods_top`), `events_list`, `namespaces_list`, `nodes_top`
+
+|`config`
+|Kubeconfig contexts (`configuration_contexts_list`; `configuration_view` is disabled in HTTP mode)
+
+|`openshift`
+|OpenShift-specific resources such as projects
+
+|`metrics`
+|PromQL queries against the Thanos querier (instant and range queries, alerts)
+
+|`netedge`
+|Network diagnostics for ingress, DNS and OVN-Kubernetes, including predefined Prometheus queries
+
+|`ossm`
+|OpenShift Service Mesh through Kiali: mesh status, traffic graph, Istio configuration and validations, traces, `ossm_manage_istio_config` (create, patch, delete Istio and Gateway API objects)
+|===
+
+Each tool carries MCP *annotations* such as `readOnlyHint` and `destructiveHint`. The server uses them to filter tools (`read_only`, `disable_destructive`); clients use them to decide which calls need human approval (Lightspeed's `tool_annotations` approval mode). Newer upstream versions rename or split some toolsets (for example `observability/metrics`) and add others (`helm`, `kubevirt`, `tekton`, `oadp`, `ovn-kubernetes`, `cluster-diagnostics`).
+
+== Installation on a Fresh Cluster
+
+The server is a single stateless Deployment configured by a TOML file. These manifests reproduce the lab chart; replace `<cluster-domain>` with your ingress domain.
+
+=== Step 1: Namespace and Service Account
+
+[source,yaml]
+----
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshift-mcp
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: openshift-mcp-server
+  namespace: openshift-mcp
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: openshift-mcp-server-view
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view                                  # <1>
+subjects:
+  - kind: ServiceAccount
+    name: openshift-mcp-server
+    namespace: openshift-mcp
+----
+<1> The server's *own* identity. With `cluster_auth_mode = "passthrough"`, it is used only for requests that carry *no* token (see <<Authentication Modes>>). Keep it minimal, or bind nothing at all if every caller must authenticate.
+
+=== Step 2: Configuration
+
+[source,yaml]
+----
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-config
+  namespace: openshift-mcp
+data:
+  config.toml: |
+    toolsets = ["core", "config", "metrics", "netedge", "openshift", "ossm"]   # <1>
+    log_level = 0                                                              # <2>
+    port = "8080"                                                              # <3>
+    read_only = false                                                          # <4>
+    cluster_auth_mode = "passthrough"                                          # <5>
+    skip_jwt_verification = true                                               # <6>
+    server_instructions = """                                                 # <7>
+    This MCP server provides access to a live OpenShift cluster. Before executing any
+    destructive operation (delete, scale down, patch, restart), clearly warn the user
+    about the consequences and ask for explicit confirmation. ...
+    """
+
+    [toolset_configs.metrics]
+    prometheus_url = "https://thanos-querier.openshift-monitoring.svc.cluster.local:9091"   # <8>
+    insecure = true                                                                          # <9>
+    auth_mode = "header"                                                                     # <10>
+
+    [toolset_configs.netedge]
+    auth_mode = "header"
+    insecure = true
+
+    [toolset_configs.kiali]
+    url = "https://kiali.istio-system.svc.cluster.local:20001"                               # <11>
+    insecure = true
+----
+<1> Toolsets to expose. Fewer toolsets means a smaller tool list in the LLM prompt and better tool selection.
+<2> Verbosity from 0 to 9. Level 5 and above log tool calls; tokens are redacted.
+<3> Setting `port` starts the server in *HTTP mode* (Streamable HTTP at `/mcp`). Without it, the server speaks MCP over stdio, for local use.
+<4> `true` exposes only tools annotated `readOnlyHint=true`, for every caller, whatever their RBAC (Module 2, Exercise 8 sets it with the `--read-only` flag).
+<5> `passthrough`: forward the caller's `Authorization` header to the Kubernetes API; when there is none, fall back to the server's own credentials (here the in-cluster service account). `kubeconfig`: always use the server's own credentials.
+<6> Do not parse or validate the bearer token. Required for OpenShift OAuth tokens (`sha256~...`), which are opaque, not JWTs. The Kubernetes API server validates them.
+<7> Sent to clients in the MCP `initialize` response. Clients include it in the model's context. It guides the model but enforces nothing.
+<8> The metrics toolset queries Thanos through its in-cluster Service.
+<9> Skip TLS verification of the Thanos certificate (signed by the service CA). Mount the service CA bundle instead for production.
+<10> `header`: send the *caller's* token to Thanos. Prometheus queries are then authorized per user: the caller needs `cluster-monitoring-view` (or namespace-level monitoring access).
+<11> Kiali endpoint for the `ossm` toolset. Kiali also receives the caller's token.
+
+==== Other Configuration Options
+
+[cols="2,3",options="header"]
+|===
+|Option
+|Effect
+
+|`disable_destructive`
+|Hide tools annotated `destructiveHint=true` (deletes, updates) while keeping creation and reads.
+
+|`enabled_tools`, `disabled_tools`
+|Allowlist, then denylist, of individual tool names, applied after toolsets.
+
+|`denied_resources`
+|`[[denied_resources]]` entries (`group`, `version`, `kind`) the server refuses to touch, for example `Secret` or RBAC kinds.
+
+|`tool_overrides.<tool>.description`
+|Replace a tool's description to steer the model (recent upstream versions only).
+
+|`confirmation_rules`, `confirmation_fallback`
+|Ask the user to confirm through MCP elicitation before matching calls, by tool name, `destructive`, or Kubernetes verb, kind and namespace (recent upstream versions only).
+
+|`require_oauth`
+|Reject requests without a bearer token (recent upstream versions only). See below.
+
+|`authorization_url`, `oauth_audience`, `oauth_scopes`
+|Validate JWTs against an OIDC provider such as Keycloak.
+
+|`token_exchange.*`
+|Exchange the validated user token for a token the cluster accepts (RFC 8693, Keycloak, Entra ID on-behalf-of).
+
+|`tls_cert`, `tls_key`, `require_tls`
+|Serve HTTPS from the pod itself instead of relying on the router.
+
+|`metrics_port`, `stateless`, `list_output`
+|Separate metrics port, disabled change notifications for load-balanced replicas, `yaml` or `table` list output.
+|===
+
+The configuration can also be split into drop-in files, and is reloaded on `SIGHUP` for most settings.
+
+=== Step 3: Deployment, Service and Route
+
+[source,yaml]
+----
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openshift-mcp-server
+  namespace: openshift-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: openshift-mcp-server}
+  template:
+    metadata:
+      labels: {app: openshift-mcp-server}
+    spec:
+      serviceAccountName: openshift-mcp-server
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: openshift-mcp-server
+          image: registry.redhat.io/openshift-mcp-tech-preview/openshift-mcp-server-rhel9:0.3
+          command: ["/openshift-mcp-server"]
+          args: ["--config", "/etc/mcp/config.toml"]        # <1>
+          ports:
+            - containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - name: mcp-config
+              mountPath: /etc/mcp
+      volumes:
+        - name: mcp-config
+          configMap:
+            name: mcp-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openshift-mcp-server
+  namespace: openshift-mcp
+spec:
+  selector: {app: openshift-mcp-server}
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: openshift-mcp-server
+  namespace: openshift-mcp
+spec:
+  host: mcp-server.<cluster-domain>                      # <2>
+  to:
+    kind: Service
+    name: openshift-mcp-server
+  port:
+    targetPort: 8080
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+----
+<1> Command-line flags override the file, for example `--read-only` or `--toolsets core,metrics`.
+<2> Only needed for clients outside the cluster network. Lightspeed and in-cluster agents use the Service.
+
+=== Step 4: Users and RBAC
+
+With token passthrough, the MCP server has no user configuration: *what a caller can do is their Kubernetes RBAC*. The lab creates two Keycloak users and binds them by name:
+
+[source,yaml]
+----
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mcp-server-mcp-admin
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: cluster-admin}
+subjects:
+  - {apiGroup: rbac.authorization.k8s.io, kind: User, name: mcp-admin}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mcp-server-mcp-viewer
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: view}
+subjects:
+  - {apiGroup: rbac.authorization.k8s.io, kind: User, name: mcp-viewer}
+----
+
+The users themselves are created in Keycloak by the `mcp-server-keycloak-setup` Job, with passwords stored in secret `openshift-mcp/mcp-user-credentials`. See xref:appendix/in-depth/keycloak.adoc[In Depth: Red Hat Build of Keycloak].
+
+A user obtains a token by logging in to OpenShift:
+
+[source,sh]
+----
+oc login -u mcp-viewer -p "$(oc get secret mcp-user-credentials -n openshift-mcp -o jsonpath='{.data.mcp-viewer}' | base64 -d)"
+oc whoami -t        # sha256~... : the bearer token for the MCP server
+----
+
+For least privilege, prefer namespaced `RoleBinding` objects to the `view` and `edit` cluster roles, and add `cluster-monitoring-view` only to users who need the metrics toolset.
+
+== Authentication Modes
+
+How the server treats the `Authorization` header is the most important design decision.
+
+[cols="2,2,3",options="header"]
+|===
+|Configuration
+|Request without a token
+|Request with a token
+
+|*Lab*: `cluster_auth_mode = "passthrough"`, `skip_jwt_verification = true`
+|Served with the server's own identity (its service account, bound to `view`)
+|Token forwarded unvalidated; the Kubernetes API authorizes it
+
+|*Strict passthrough*: same, plus `require_oauth = true`
+|Rejected with `401`
+|Token forwarded unvalidated; the Kubernetes API authorizes it
+
+|*OIDC*: `require_oauth = true`, `authorization_url = "https://sso.<cluster-domain>/realms/keycloak"`, `oauth_audience = "<client>"`
+|Rejected with `401`
+|JWT validated against Keycloak (signature, issuer, audience); then forwarded, or exchanged with `token_exchange`
+
+|`cluster_auth_mode = "kubeconfig"`
+|Served with the server's identity
+|Token ignored; every caller gets the server's identity
+|===
+
+[WARNING]
+====
+In the lab's configuration, a request that reaches the public Route *without* a token is served with the server's own service account, which has cluster-wide `view`. On a shared or long-lived cluster, set `require_oauth = true` (when your image supports it), or remove the server's `view` binding, or do not expose the Route publicly.
+====
+
+=== Header Names
+
+The server reads the Kubernetes token from:
+
+. `Authorization: Bearer <token>` — standard; used by opencode and other MCP clients.
+. `kubernetes-authorization: Bearer <token>` — fallback custom header. Lightspeed uses it, so that `Authorization` stays available for authenticating to the MCP endpoint itself.
+
+=== Using Keycloak JWTs Directly
+
+The Kubernetes API in this environment accepts OpenShift OAuth tokens, not Keycloak JWTs, so the lab uses OpenShift login. To accept Keycloak tokens at the MCP server, two designs are possible:
+
+* *OIDC validation plus token exchange*: configure `authorization_url` and `oauth_audience` to validate Keycloak JWTs, and a `token_exchange` block (`strategy = "keycloak-v1"` or `"rfc8693"`) so the server exchanges them for a token the cluster accepts.
+* *Direct OIDC authentication on the API server*: configure the cluster to trust Keycloak as a token issuer, then forward Keycloak JWTs unchanged with passthrough.
+
+== Clients
+
+=== opencode (`mcp-cli` Pod)
+
+[source,json]
+----
+"mcp": {
+  "openshift": {
+    "type": "remote",
+    "url": "https://mcp-server.<cluster-domain>/mcp",
+    "headers": { "Authorization": "Bearer {env:OPENSHIFT_MCP_TOKEN}" },
+    "enabled": true
+  }
+}
+----
+
+opencode expands `{env:OPENSHIFT_MCP_TOKEN}` at startup, so switching user means restarting opencode with another token: `oc exec -it -n mcp-cli deploy/mcp-cli -- env OPENSHIFT_MCP_TOKEN=$MCP_VIEWER_TOKEN opencode`.
+
+=== OpenShift Lightspeed
+
+[source,yaml]
+----
+spec:
+  featureGates: [MCPServer]
+  mcpServers:
+    - name: openshift-mcp
+      url: http://openshift-mcp-server.openshift-mcp.svc.cluster.local:8080/mcp
+      timeout: 120
+      headers:
+        - name: kubernetes-authorization
+          valueFrom:
+            type: kubernetes      # token of the console user asking the question
+----
+
+Lightspeed can also deploy its own built-in MCP server (`ols.introspectionEnabled`, default `true`). This lab adds the standalone server so that the same endpoint serves Lightspeed and external clients, with the toolsets of its choice. See xref:appendix/in-depth/openshift-lightspeed.adoc[In Depth: OpenShift Lightspeed].
+
+=== Agentic Runs
+
+An `AgenticRun` can reference the server in `spec.tools.mcpServers`, with `valueFrom.type: ServiceAccountToken`. The sandbox then sends its per-step service account token, so the MCP server acts with exactly the step's permissions: read-only during analysis, the approved option's rules during execution.
+
+=== Any MCP Client
+
+[source,sh]
+----
+TOKEN=$(oc whoami -t)
+curl -s https://mcp-server.<cluster-domain>/mcp \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
+----
+
+The response contains the server's capabilities and its `instructions`. A real client then sends `notifications/initialized`, `tools/list` and `tools/call`, reusing the `Mcp-Session-Id` header returned by `initialize`.
+
+== Request Flow of a Tool Call
+
+----
+client              MCP server                     kube-apiserver
+  │ tools/call resources_create_or_update             │
+  │ Authorization: Bearer T                           │
+  │───────────────────▶│                              │
+  │                    │ no JWT validation            │
+  │                    │ Kubernetes client with T     │
+  │                    │── PATCH configmaps/hack ────▶│
+  │                    │   (Bearer T)                 │ TokenReview:
+  │                    │                              │   User mcp-viewer
+  │                    │                              │ RBAC: denied
+  │                    │◀─────── 403 Forbidden ───────│
+  │◀── tool result: configmaps "hack" is forbidden:   │
+  │    User "mcp-viewer" cannot patch ...             │
+----
+
+The error is returned to the model *as a tool result*, so the AI can explain it to the user.
+
+== Operating and Troubleshooting
+
+[cols="2,3",options="header"]
+|===
+|Task
+|Command
+
+|Show the effective configuration
+|`oc get configmap mcp-config -n openshift-mcp -o jsonpath='{.data.config\.toml}'`
+
+|Switch to read-only mode for everyone
+|`oc patch deployment openshift-mcp-server -n openshift-mcp --type=json -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--read-only"}]'`
+
+|Check what a user can do through the server
+|`oc auth can-i --list --as=mcp-viewer -n <namespace>`
+
+|Watch tool calls
+|Raise `log_level` to 5 or more, then `oc logs -f deploy/openshift-mcp-server -n openshift-mcp`
+|===
+
+Common problems:
+
+* *`401` from tools after a while* — OpenShift OAuth tokens expire (24 hours by default); log in again.
+* *Metrics tools fail with `403`* — the caller lacks `cluster-monitoring-view`.
+* *Lightspeed sees no tools* — the `MCPServer` feature gate is missing, the URL is wrong, or `timeout` is too short for the first `tools/list`.
+* *Changes to `mcp-config` have no effect* — restart the Deployment (or send `SIGHUP`); the ConfigMap is read at startup.

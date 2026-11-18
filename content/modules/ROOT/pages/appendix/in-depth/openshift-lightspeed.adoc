@@ -1,0 +1,1148 @@
+= In Depth: OpenShift Lightspeed and the Agentic Operator
+
+include::partial$_attributes.adoc[]
+
+:page-toclevels: 3
+
+This page explains how OpenShift Lightspeed and its agentic layer are installed and configured: the Lightspeed operator and its `OLSConfig`, the agentic operator and its custom resources (`LLMProvider`, `Agent`, `ApprovalPolicy`, `AgenticRun`, `AgenticRunApproval`, `AgenticOLSConfig`), the alerts adapter, and the sandbox pods that run the agent. It is written for engineers who want to reproduce the setup on a fresh cluster.
+
+== What It Does
+
+OpenShift Lightspeed is an AI assistant integrated in the OpenShift web console. It has two layers:
+
+* *Lightspeed (OLS)* — a chat service. A user asks a question in the console; the Lightspeed service sends it to an LLM together with retrieved documentation and the results of tool calls (through MCP servers), and streams the answer back. Tool calls run *with the user's own identity*.
+* *Agentic Lightspeed* — an autonomous workflow engine. An `AgenticRun` describes a problem; the agentic operator runs an LLM agent through *analysis*, *execution* and *verification* steps, each in an ephemeral sandbox pod with its own service account, with human approval gates between steps. Runs are created by hand, by the `oc agentic` CLI, or automatically by the *alerts adapter* from firing Prometheus alerts.
+
+== Architecture
+
+----
+namespace openshift-lightspeed
+│
+├─ lightspeed-operator ── reconciles OLSConfig "cluster" ──▶
+│    ├─ lightspeed-app-server       OLS API: calls the LLM and MCP servers
+│    ├─ lightspeed-console-plugin   chat UI in the console
+│    ├─ lightspeed-postgres-server  conversations, audit and sandbox logs
+│    ├─ agentic console plugin      Agentic Runs UI
+│    ├─ alerts adapter              when alertsAdapter.configMapRef is set
+│    ├─ OTEL collector, RHOKP       telemetry, offline documentation
+│    └─ ConfigMap lightspeed-agentic-configuration  (sandbox pod template)
+│
+└─ lightspeed-agentic-operator ── reconciles AgenticRun ──▶
+     ├─ reads LLMProvider, Agent, ApprovalPolicy, AgenticOLSConfig
+     ├─ webhook: records the approver on AgenticRunApproval
+     └─ sandbox pods ls-analysis-* / ls-execution-* / ls-verification-*
+          one per step, own ServiceAccount, deleted after the step
+
+app-server ─── chat tool calls (user token) ───▶ OpenShift MCP Server
+app-server, sandbox pods ─── LLM calls ───▶ LLM endpoint (OpenAI-compatible)
+----
+
+[#ols20-installation]
+== OLS 2.0 Installation
+
+Lightspeed operator *v2.0* bundles classic OLS and Agentic OLS in a single operator. One OLM install deploys both controllers, so no separate agentic operator install is needed. This section walks through a complete 2.0 setup on a fresh cluster.
+
+*Prerequisites*
+
+* An OpenShift 5.0+ cluster, with `cluster-admin` access.
+* The `oc` CLI, logged in to the cluster.
+* An API key for an LLM provider. The examples use OpenAI; Anthropic, Google Cloud Vertex AI and AWS Bedrock are also supported.
+
+[#ols20-install-operator]
+=== 2.0 Step 1: Install the Operator
+
+*Option A — OperatorHub (recommended).* In the console, go to *OperatorHub*, search for _OpenShift Lightspeed_ and install it with the defaults.
+
+*Option B — Subscription (CLI):*
+
+[source,sh,role=execute]
+----
+oc apply -f - <<'EOF'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshift-lightspeed
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: openshift-lightspeed
+  namespace: openshift-lightspeed
+spec:
+  targetNamespaces:
+    - openshift-lightspeed
+  upgradeStrategy: Default
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: lightspeed-operator
+  namespace: openshift-lightspeed
+spec:
+  channel: stable
+  name: lightspeed-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Automatic
+EOF
+----
+
+Wait for the CSV to succeed:
+
+[source,sh,role=execute]
+----
+oc wait --for=jsonpath='{.status.phase}'=Succeeded csv -n openshift-lightspeed \
+  -l operators.coreos.com/lightspeed-operator.openshift-lightspeed \
+  --timeout=300s
+----
+
+Check that both controllers are running:
+
+[source,sh,role=execute]
+----
+oc get deploy -n openshift-lightspeed
+----
+
+Expected output includes:
+
+----
+lightspeed-operator-controller-manager           1/1
+lightspeed-agentic-operator-controller-manager   1/1
+----
+
+[#ols20-classic]
+=== 2.0 Step 2: Configure Classic OLS
+
+. *Create the LLM credentials secret.* Classic OLS reads the key `apitoken`:
++
+[source,sh,role=execute]
+----
+oc apply -f - <<'EOF'
+apiVersion: v1
+kind: Secret
+metadata:
+  name: credentials
+  namespace: openshift-lightspeed
+type: Opaque
+stringData:
+  apitoken: <YOUR_OPENAI_API_KEY>
+EOF
+----
+
+. *Create the `OLSConfig`:*
++
+[source,sh,role=execute]
+----
+oc apply -f - <<'EOF'
+apiVersion: ols.openshift.io/v1alpha1
+kind: OLSConfig
+metadata:
+  name: cluster
+spec:
+  llm:
+    providers:
+      - name: openai
+        type: openai
+        credentialsSecretRef:
+          name: credentials
+        url: https://api.openai.com/v1
+        models:
+          - name: gpt-5.6-luna
+            parameters:
+              reasoningConfig:
+                effort: high
+  ols:
+    defaultModel: gpt-5.6-luna
+    defaultProvider: openai
+    logLevel: DEBUG
+EOF
+----
+
+. *Wait for the app server.* This can take several minutes, because the `rhokp` (offline knowledge portal) image is large:
++
+[source,sh,role=execute]
+----
+oc wait --for=condition=Available deployment/lightspeed-app-server \
+  -n openshift-lightspeed --timeout=900s
+----
+
+Dependency chain: `Secret/credentials` → `OLSConfig/cluster`.
+
+[#ols20-agentic]
+=== 2.0 Step 3: Configure Agentic OLS
+
+. *Create the agentic LLM credentials secret.* The agentic operator uses a separate secret with a different key name: `OPENAI_API_KEY` instead of `apitoken`.
++
+[source,sh,role=execute]
+----
+oc apply -f - <<'EOF'
+apiVersion: v1
+kind: Secret
+metadata:
+  name: llm-creds-openai
+  namespace: openshift-lightspeed
+type: Opaque
+stringData:
+  OPENAI_API_KEY: <YOUR_OPENAI_API_KEY>
+EOF
+----
+
+. *Create the `LLMProvider`:*
++
+[source,sh,role=execute]
+----
+oc apply -f - <<'EOF'
+apiVersion: agentic.openshift.io/v1alpha1
+kind: LLMProvider
+metadata:
+  name: openai
+  namespace: openshift-lightspeed
+spec:
+  type: OpenAI
+  openAI:
+    credentialsSecret:
+      name: llm-creds-openai
+EOF
+----
+
+. *Create the default `Agent`.* The agent named `default` is required. Other tiers (for example `smart` or `fast`) are optional.
++
+[source,sh,role=execute]
+----
+oc apply -f - <<'EOF'
+apiVersion: agentic.openshift.io/v1alpha1
+kind: Agent
+metadata:
+  name: default
+  namespace: openshift-lightspeed
+spec:
+  llmProvider:
+    name: openai
+  model: gpt-5.6-luna
+  reasoningConfig:
+    effort: high
+    summary: auto
+  timeouts:
+    analysisSeconds: 600
+    executionSeconds: 600
+    verificationSeconds: 600
+EOF
+----
++
+NOTE: The 2.0 manifests set `metadata.namespace` on `LLMProvider` and `Agent`, while the development build described in <<Configuring the Agentic Resources>> defines them as cluster-scoped. Check the scope on your cluster with `oc api-resources --api-group=agentic.openshift.io`.
+
+. *(Optional) Create the `ApprovalPolicy`.* Without a policy, every step defaults to `Manual` except `Escalation`, so each step waits for your approval. The policy below approves analysis, verification and escalation automatically, and only execution needs a manual approval:
++
+[source,sh,role=execute]
+----
+oc apply -f - <<'EOF'
+apiVersion: agentic.openshift.io/v1alpha1
+kind: ApprovalPolicy
+metadata:
+  name: cluster
+spec:
+  maxConcurrentRuns: 5
+  stages:
+    - name: Analysis
+      approval: Automatic
+    - name: Execution
+      approval: Manual
+    - name: Verification
+      approval: Automatic
+    - name: Escalation
+      approval: Automatic
+EOF
+----
+
+. *Create the reader RBAC for the agent service account.*
++
+[IMPORTANT]
+====
+In v2.0.0 the operator does *not* create these `ClusterRoleBinding` objects. The OLM bundle creates the `lightspeed-agent` service account but not its bindings; only the upstream quickstart script (`hack/quickstart/deploy-operator.sh`) creates them. The agentic controller looks for existing bindings whose subject is `lightspeed-agent`. Without them, every `AgenticRun` fails immediately with:
+
+----
+claim sandbox: add subject to reader ClusterRoleBinding: no ClusterRoleBinding
+found with subject openshift-lightspeed/lightspeed-agent — ensure reader RBAC
+is configured
+----
+====
++
+[source,sh,role=execute]
+----
+oc apply -f - <<'EOF'
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: lightspeed-agent-cluster-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-reader
+subjects:
+- kind: ServiceAccount
+  name: lightspeed-agent
+  namespace: openshift-lightspeed
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: lightspeed-agent-monitoring-view
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-monitoring-view
+subjects:
+- kind: ServiceAccount
+  name: lightspeed-agent
+  namespace: openshift-lightspeed
+EOF
+----
+
+. *Grant execution RBAC to the agentic operator (Tech Preview).*
++
+[IMPORTANT]
+====
+The analysis LLM proposes the RBAC for the execution sandbox based on the remediation it plans, and that RBAC can cover any API group: `monitoring.coreos.com` for alert fixes, `tekton.dev` for pipeline repairs, `route.openshift.io` for ingress changes, and so on. Kubernetes RBAC escalation prevention lets the operator create only Roles whose permissions it already holds. A ClusterRole scoped to common API groups (`apps`, `batch`, `networking.k8s.io`) therefore fails as soon as a plan needs anything outside that set. For example, an alert remediation failed with:
+
+----
+roles.rbac.authorization.k8s.io is forbidden: user "system:serviceaccount:
+openshift-lightspeed:lightspeed-agentic-operator-controller-manager" is
+attempting to grant RBAC permissions not currently held:
+{APIGroups:["monitoring.coreos.com"], Resources:["prometheusrules"],
+Verbs:["delete"]} {APIGroups:["monitoring.coreos.com"],
+Resources:["prometheusrules"], Verbs:["create"]}
+----
+
+For the tech preview, `cluster-admin` is the only reliable option. A proper design for execution RBAC has not been addressed yet.
+====
++
+[source,sh,role=execute]
+----
+oc apply -f - <<'EOF'
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: lightspeed-agentic-controller-cluster-admin-extra
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: lightspeed-agentic-operator-controller-manager
+  namespace: openshift-lightspeed
+EOF
+----
+
+Dependency chain:
+
+----
+Secret/llm-creds-openai ─▶ LLMProvider/openai ─▶ Agent/default ─┐
+ApprovalPolicy/cluster ─────────────────────────────────────────┤
+CRBs cluster-reader + cluster-monitoring-view (agent SA) ───────┼▶ AgenticRun
+CRB cluster-admin (operator SA) ─▶ execution step ──────────────┘
+----
+
+[#ols20-alerts-adapter]
+=== 2.0 Step 4: Configure the Alerts Adapter (Optional)
+
+The alerts adapter watches Alertmanager and creates an `AgenticRun` for each matching alert (see <<The Alerts Adapter>> for all configuration fields).
+
+. *Create the adapter ConfigMap:*
++
+[source,sh,role=execute]
+----
+oc apply -f - <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alerts-adapter-config
+  namespace: openshift-lightspeed
+data:
+  config.yaml: |
+    filtering:
+      allowedReceivers:
+      - critical
+    tools:
+      skills:
+        - image: quay.io/openshiftanalytics/agentic-skills:latest
+          paths:
+            - /skills/cluster-troubleshoot/investigate-alert
+EOF
+----
+
+. *Enable the adapter in the `OLSConfig`:*
++
+[source,sh,role=execute]
+----
+oc patch olsconfig cluster --type=merge -p '{
+  "spec": {
+    "ols": {
+      "deployment": {
+        "alertsAdapter": {
+          "configMapRef": {
+            "name": "alerts-adapter-config"
+          }
+        }
+      }
+    }
+  }
+}'
+----
+
+. *Wait for the adapter deployment:*
++
+[source,sh,role=execute]
+----
+oc rollout status deployment/lightspeed-agentic-alerts-adapter \
+  -n openshift-lightspeed --timeout=300s
+----
+
+[#ols20-verify]
+=== 2.0 Step 5: Verify the Installation
+
+. *Check that all deployments are ready:*
++
+[source,sh,role=execute]
+----
+oc get deploy -n openshift-lightspeed
+----
++
+Expected, all `READY`:
++
+----
+lightspeed-operator-controller-manager
+lightspeed-agentic-operator-controller-manager
+lightspeed-app-server
+lightspeed-agentic-console-plugin
+lightspeed-console-plugin
+lightspeed-otel-collector
+lightspeed-postgres-server
+lightspeed-rhokp
+openshift-mcp-server
+----
+
+. *Check that all custom resources exist:*
++
+[source,sh,role=execute]
+----
+oc get olsconfig cluster
+oc get llmprovider openai -n openshift-lightspeed
+oc get agent default -n openshift-lightspeed
+oc get approvalpolicy cluster
+----
+
+. *Submit a test `AgenticRun`:*
++
+[source,sh,role=execute]
+----
+oc apply -f - <<'EOF'
+apiVersion: agentic.openshift.io/v1alpha1
+kind: AgenticRun
+metadata:
+  name: namespace-inventory
+  namespace: openshift-lightspeed
+spec:
+  request: |
+    Investigate what is running in the openshift-lightspeed namespace.
+    List all pods, deployments, and services. Summarize each workload,
+    its current status, and flag any problems (CrashLoopBackOff,
+    ImagePullBackOff, Pending, restarts, etc.). Propose remediation
+    for any issues found.
+  analysis:
+    agent: default
+  execution:
+    agent: default
+EOF
+----
++
+Watch its progress, then read its conditions:
++
+[source,sh,role=execute]
+----
+oc get agenticrun namespace-inventory -n openshift-lightspeed -w
+oc get agenticrun namespace-inventory -n openshift-lightspeed \
+  -o jsonpath='{.status.conditions[*].message}' | tr ',' '\n'
+----
++
+A successful run reports `Analysis complete — no action required` and `Outcome: Succeeded`, and fills `status.tokenUsage` with input and output token counts.
++
+* If the run fails with the reader RBAC error, go back to the reader RBAC step of <<ols20-agentic,2.0 Step 3>>.
+* If `Analysis` is `Manual` (or no `ApprovalPolicy` exists), the run waits at _analysis pending approval_. Either set `Analysis` to `Automatic` in the policy, or approve it in the run's `AgenticRunApproval` (see <<Approving with AgenticRunApproval>>).
++
+Clean up:
++
+[source,sh,role=execute]
+----
+oc delete agenticrun namespace-inventory -n openshift-lightspeed
+----
+
+. *Test the alerts adapter* (requires 2.0 Step 4). Create a synthetic alert that always fires:
++
+[source,sh,role=execute]
+----
+oc apply -f - <<'EOF'
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: demo-critical-alert
+  namespace: openshift-monitoring
+spec:
+  groups:
+    - name: demo
+      rules:
+        - alert: DemoCriticalAlert
+          expr: vector(1)
+          labels:
+            severity: critical
+            namespace: openshift-monitoring
+          annotations:
+            summary: Demo critical alert for agentic run testing
+            description: Synthetic critical alert that always fires. Delete the PrometheusRule to clear.
+EOF
+----
++
+The adapter picks it up and creates an `AgenticRun`:
++
+[source,sh,role=execute]
+----
+oc get agenticrun -n openshift-lightspeed -w
+----
++
+With the `ApprovalPolicy` from 2.0 Step 3, analysis is approved automatically and execution waits for a manual approval. The analysis agent should identify the alert as synthetic and propose deleting the `PrometheusRule`.
++
+Clean up:
++
+[source,sh,role=execute]
+----
+oc delete prometheusrule demo-critical-alert -n openshift-monitoring
+oc delete agenticrun -n openshift-lightspeed -l agentic.openshift.io/source=alerts-adapter
+----
+
+[#ols20-observability]
+=== OTEL, Tracing and Logging
+
+The `OLSConfig` deploys and enables the OTEL collector, the PostgreSQL backend and audit logging by default. No extra configuration is needed. The pipeline:
+
+----
+Operator traces ─▶ OTEL collector ─▶ traces.jsonl (file exporter)
+Sandbox logs    ─▶ OTEL collector ─▶ PostgreSQL (templogs.logs table)
+Dataverse export: a sidecar reads the traces for Red Hat telemetry
+----
+
+In a test, one successful `AgenticRun` produced 2,276 log rows in PostgreSQL and 23 OTEL trace spans.
+
+[#ols20-known-issues]
+=== Known Issues in v2.0.0
+
+[cols="1,3",options="header"]
+|===
+|Issue
+|Details
+
+|Reader RBAC is not created automatically
+|The OLM bundle creates the `lightspeed-agent` service account but not the `ClusterRoleBinding` objects it needs. Create them yourself (2.0 Step 3). There is no guidance yet on the minimal set: `cluster-reader` and `cluster-monitoring-view` are the baseline, but analysis may need more reader roles depending on the resources it inspects (for example `PerformanceProfile` or `Tuned`). OLS-4632 plans to make reader roles configurable through `HubConfig`/`SpokeCluster` for multicluster. It is not implemented yet and does not cover the single-cluster OLM gap.
+
+|Execution RBAC is not created automatically
+|The ClusterRole that OLM grants to the operator controller service account is too narrow for execution. The analysis LLM can propose RBAC in any API group, so any fixed, scoped ClusterRole will eventually miss a case. `cluster-admin` is currently the only reliable option (2.0 Step 3). A proper execution RBAC design is explicitly out of scope for OLS-4632 and has no ticket yet.
+
+|Two LLM secret keys are required
+|Classic OLS reads key `apitoken` in secret `credentials`; agentic OLS reads key `OPENAI_API_KEY` in secret `llm-creds-openai`. One secret can hold both keys with the same value. `OLSConfig` supports `credentialKey` to override the default `apitoken`, but `LLMProvider` hardcodes the key name for each provider type.
+
+|The `rhokp` image pull is slow
+|The offline knowledge portal image is about 7.7 GB compressed and requests 75Gi of ephemeral storage. The first pull can take 5 to 20 minutes.
+|===
+
+[#ols20-advanced-olsconfig]
+=== Advanced OLSConfig
+
+Other `OLSConfig` fields, not set in <<ols20-classic,2.0 Step 2>>:
+
+[cols="2,3",options="header"]
+|===
+|Field
+|Purpose
+
+|`ols.toolsApprovalConfig.approvalType`
+|Human approval of tool calls in the chat: `tool_annotations` (default — only tools the MCP server marks as needing approval, such as `pods_exec`), `always`, or `never`. `approvalTimeout` (default 600 s) is how long Lightspeed waits.
+
+|`ols.introspectionEnabled`
+|Default `true`: the operator also deploys its *built-in* OpenShift MCP server for cluster introspection. Set to `false` to rely only on `spec.mcpServers`.
+
+|`ols.mcpKubeServerConfig.timeout`
+|Timeout of the built-in MCP server (default 60 s).
+
+|`ols.toolFilteringConfig`
+|With the `ToolFiltering` gate: retrieve only the `topK` (default 10) most relevant tools per question by hybrid search (`alpha`, `threshold`), to keep large tool sets out of the prompt.
+
+|`ols.querySystemPrompt`
+|Replaces the built-in system prompt.
+
+|`ols.queryFilters`
+|Regex `pattern` / `replaceWith` pairs applied to questions before they leave the cluster (for example to redact IP addresses).
+
+|`ols.rag`
+|Bring-your-own RAG: container `image` with a FAISS index at `indexPath`. `byokRAGOnly: true` disables the built-in documentation retrieval.
+
+|`ols.guardrails.toolResultInspection.enabled`
+|Inspect tool results before they are passed to the model (default `true`).
+
+|`ols.quotaHandlersConfig`
+|Token quotas: `limitersConfig` entries of type `user_limiter` or `cluster_limiter`, with `initialQuota`, `quotaIncrease`, `period`.
+
+|`ols.proxyConfig`, `ols.additionalCAConfigMapRef`
+|Egress proxy and extra CA bundle for the LLM endpoint.
+
+|`ols.tlsConfig`, `ols.tlsSecurityProfile`
+|Certificate and TLS profile of the Lightspeed API endpoint.
+
+|`ols.userDataCollection`
+|`feedbackDisabled`, `transcriptsDisabled`: opt out of sending feedback and transcripts to Red Hat.
+
+|`ols.deployment.<component>`
+|`replicas`, `resources`, `nodeSelector`, `tolerations` for `api`, `console`, `database`, `mcpServer`, `alertsAdapter`, `agenticConsole`, `otelCollector`, `rhokp`, `dataCollector`.
+
+|`agenticOLS.sandboxMode`
+|How sandbox pods are created: `bare-pod` (default) or Agent Sandbox API claims.
+
+|`agenticOLS.agenticSandboxConfig`
+|`resources`, `nodeSelector`, `tolerations` merged into every sandbox pod.
+
+|`agenticOLS.terminalTTL`
+|How many days finished `AgenticRun` objects are kept.
+
+|`audit.logging`, `audit.tracingEndpoint`
+|Store audit logs in PostgreSQL through the OTEL collector (default `true`), and export traces to an OTLP endpoint.
+|===
+
+
+== Configuring the Agentic Resources
+
+=== LLMProvider
+
+[source,yaml]
+----
+apiVersion: v1
+kind: Secret
+metadata:
+  name: llm-creds-openai
+  namespace: openshift-lightspeed            # <1>
+type: Opaque
+stringData:
+  OPENAI_API_KEY: <api-key>                  # <2>
+---
+apiVersion: agentic.openshift.io/v1alpha1
+kind: LLMProvider
+metadata:
+  name: openai                               # <3>
+spec:
+  type: OpenAI                               # <4>
+  openAI:
+    url: https://<llm-endpoint>/v1           # <5>
+    credentialsSecret:
+      name: llm-creds-openai
+----
+<1> Credential secrets are always read from the operator namespace.
+<2> The required key depends on the type: `OPENAI_API_KEY` (OpenAI), `ANTHROPIC_API_KEY` (Anthropic), `AZURE_OPENAI_API_KEY` (AzureOpenAI), `GOOGLE_APPLICATION_CREDENTIALS` (GoogleCloudVertex, a service account JSON key), AWS keys (AWSBedrock).
+<3> Cluster-scoped: no namespace. Referenced by `Agent.spec.llmProvider.name`.
+<4> `Anthropic`, `GoogleCloudVertex`, `OpenAI`, `AzureOpenAI` or `AWSBedrock`. Exactly one matching block (`openAI`, `anthropic`, `googleCloudVertex` with `projectID`, `region`, `modelProvider`, `azureOpenAI` with `endpoint`, `apiVersion`, `awsBedrock` with `region`) must be set.
+<5> Optional endpoint override, for proxies and OpenAI-compatible gateways.
+
+The provider carries no model: the model is chosen per `Agent`, so several agents can share one provider.
+
+=== Agent
+
+[source,yaml]
+----
+apiVersion: agentic.openshift.io/v1alpha1
+kind: Agent
+metadata:
+  name: default                       # <1>
+spec:
+  llmProvider:
+    name: openai                      # <2>
+  model: <model-name>                 # <3>
+  timeouts:                           # <4>
+    analysisSeconds: 1800
+    executionSeconds: 1800
+    verificationSeconds: 1800
+  maxTurns: 200                       # <5>
+  # reasoningConfig: {...}            # <6>
+  # instructions:                     # <7>
+  #   analysis:
+  #     systemPrompt: "..."
+  #     userPrompt: "..."
+----
+<1> Cluster-scoped. An agent named `default` *must exist*: it is used for every step that does not name an agent. The lab also defines an identical agent named `smart`, because some clients request that name.
+<2> The `LLMProvider` to use.
+<3> Model identifier as known by the provider.
+<4> Per-step time limits. Defaults: 600 s for analysis, execution and escalation, 1800 s for verification. Slow models need more: the lab uses 1800 s everywhere.
+<5> Maximum tool-use turns per step, to stop runaway loops.
+<6> Provider-specific reasoning parameters, passed through as is.
+<7> Per-step overrides of the built-in system prompt and of the user prompt template (a Go template). Leave empty to use the product prompts.
+
+A common pattern is several tiers — for example `smart` (large model) for analysis and `fast` (small model) for verification — selected per step in each `AgenticRun`.
+
+=== ApprovalPolicy
+
+[source,yaml]
+----
+apiVersion: agentic.openshift.io/v1alpha1
+kind: ApprovalPolicy
+metadata:
+  name: cluster                    # <1>
+spec:
+  maxConcurrentRuns: 5             # <2>
+  stages:
+    - name: Analysis
+      approval: Manual             # <3>
+    - name: Execution
+      approval: Manual
+    - name: Verification
+      approval: Automatic
+----
+<1> Cluster-scoped singleton.
+<2> Maximum number of runs reconciled at the same time (default 5).
+<3> `Automatic` or `Manual` for `Analysis`, `Execution`, `Verification` and `Escalation`. Omitted steps default to `Manual`, except `Escalation` (read-only report), which defaults to `Automatic`. Without any `ApprovalPolicy`, the same defaults apply. Exercise 4 of Module 1 switches `Analysis` to `Automatic`.
+
+A step starts when the policy says `Automatic` *or* when the run's `AgenticRunApproval` contains an `Approved` entry for that step.
+
+=== Emergency Stop: AgenticOLSConfig
+
+[source,yaml]
+----
+apiVersion: agentic.openshift.io/v1alpha1
+kind: AgenticOLSConfig
+metadata:
+  name: cluster
+spec:
+  suspended: true
+----
+
+`suspended: true` terminates every non-terminal run with an `EmergencyStopped` condition. The lab's `ValidatingAdmissionPolicy` `agentic.openshift.io-agenticrun-suspension` (bound with `paramRef.name: cluster`) also rejects new `AgenticRun` objects while suspended. Setting it back to `false` allows new runs; stopped runs stay terminal.
+
+
+== AgenticRun in Detail
+
+=== Anatomy of a Run
+
+[source,yaml]
+----
+apiVersion: agentic.openshift.io/v1alpha1
+kind: AgenticRun
+metadata:
+  name: payment-errors
+  namespace: openshift-lightspeed               # <1>
+spec:
+  request: |                                    # <2>
+    Alert PaymentErrorRateHigh is firing in namespace payments:
+    more than 15% of HTTP requests return 5xx.
+  analysis:
+    agent: default                              # <3>
+  execution:
+    agent: default                              # <4>
+  verification:
+    agent: default                              # <5>
+  tools:
+    skills:                                     # <6>
+      - image: quay.io/openshiftanalytics/agentic-skills:latest
+        paths:
+          - /skills/cluster-troubleshoot/investigate-alert
+    # mcpServers:                               # <7>
+    #   - name: openshift
+    #     url: http://openshift-mcp-server.openshift-mcp.svc:8080/mcp
+    #     timeoutSeconds: 60
+    #     headers:
+    #       - name: Authorization
+    #         valueFrom:
+    #           type: ServiceAccountToken
+    # requiredSecrets:                          # <8>
+    #   - name: github-token
+    #     mountAs: {type: EnvVar, envVar: {name: GH_TOKEN}}
+  # analysisOutput:                             # <9>
+  #   mode: Default
+  # terminalTTL: 7                              # <10>
+  # targetCluster: <spoke-name>                 # <11>
+----
+<1> Runs created by the alerts adapter live in `openshift-lightspeed`.
+<2> The problem statement passed to the agent: an alert description, a user request, or anything else.
+<3> Required. The `Agent` used for analysis (`default` when the field is omitted).
+<4> Optional. *Omit `execution` for an advisory or assisted run*: the agent only proposes, and a human applies the fix.
+<5> Optional. Omit to skip verification.
+<6> Skills: OCI images whose directories are mounted into the sandbox as Kubernetes *image volumes* (requires Kubernetes 1.34 or later). A skill is a packaged set of instructions and scripts the agent can use.
+<7> MCP servers available to the agent. `ServiceAccountToken` sends the step's own service account token, so the MCP server acts with the step's permissions; `Secret` sends a fixed value.
+<8> Secrets from the operator namespace exposed to the sandbox as environment variables or files.
+<9> `Default` includes all built-in output properties (diagnosis, remediation options, RBAC, verification plan); `Minimal` fewer. `schema` adds a required, adapter-specific `components` property to each option.
+<10> Days to keep the run once it is terminal.
+<11> Run against a registered spoke cluster instead of the local cluster.
+
+Per-step `tools` overrides (`spec.analysis.tools`, and so on) replace the shared tools for that step. `spec.revisionFeedback` lets a user ask for a revised analysis: patching it re-runs the analysis with the feedback.
+
+=== Lifecycle
+
+----
+Pending ─[gate Analysis]─▶ Analyzing ─▶ Proposed
+                                           │
+                         [gate Execution, option selected]
+                                           ▼
+            Executing ─[gate Verification]─▶ Verifying ─▶ Completed
+                                                 │
+                                         verification fails
+                                                 ▼
+                                    Escalating ─▶ Escalated
+
+Any stage denied ─▶ Denied          Timeout or error ─▶ Failed
+AgenticOLSConfig.spec.suspended ─▶ EmergencyStopped
+----
+
+For each step the operator:
+
+. Checks the gate (policy or approval).
+. Creates a per-step `ServiceAccount` `ls-<anl|exe|ver|esc>-<run-uid>`, and its own copies of the `lightspeed-agent` reader bindings.
+. Creates a `Role` `ls-result-<step>-<run-uid>` allowing that account to create and update *only its own result object* (`AnalysisResult`, and so on).
+. For execution only: creates a `Role`/`RoleBinding` `ls-exec-<run-uid>` in each target namespace, and a `ClusterRole`/`ClusterRoleBinding` `ls-exec-cluster-<run-uid>` for cluster-scoped rules, containing *exactly the RBAC rules of the approved option*.
+. Starts a sandbox pod (`ls-analysis-*`, `ls-execution-*`, `ls-verification-*`) from the pod template in ConfigMap `lightspeed-agentic-configuration`, running as the step's service account, with the LLM credentials, the skills and the prompt in `/input`.
+. Waits for the result object, then deletes the pod and the step's RBAC.
+
+=== Remediation Options and Their RBAC
+
+The `AnalysisResult` contains a list of remediation `options`. Each option carries its own diagnosis, a remediation plan with a risk assessment, a verification plan, and the permissions its actions need (abridged):
+
+[source,yaml]
+----
+options:
+  - title: Roll back reporting-service to v1.0.1
+    summary: The v1.0.2 release leaks database connections ...
+    diagnosis: {...}
+    remediationPlan:
+      description: Roll the deployment back to the last known good release.
+      actions:
+        - description: Undo the last rollout of reporting-service
+          command: oc rollout undo deployment/reporting-service -n payments
+      risk: Low                   # Low, Medium, High or Critical
+      reversible: Reversible      # Reversible, Irreversible or Partial
+    verification: {...}
+    rbac:
+      namespaceScoped:
+        - namespace: payments
+          apiGroups: ["apps"]
+          resources: ["deployments"]
+          resourceNames: ["reporting-service"]
+          verbs: ["get", "patch"]
+          justification: Roll back the deployment to the previous ReplicaSet
+      # clusterScoped: [...]     # same shape, without namespace
+----
+
+These rules become the execution step's `Role`. Reviewing an option therefore means reviewing both its actions and its permissions (see <<How RBAC Works>>).
+
+=== How RBAC Works
+
+The agentic operator never runs an agent with its own identity or with a shared one. Each *step* of a run runs in its own sandbox pod, as its own short-lived service account, with RBAC created just before the step starts and deleted when it ends. The details below come from the operator source (`controller/agenticrun/rbac.go` and `sandbox_manager.go`) of the build listed at the top of this page.
+
+==== Steps and Their Identities
+
+[cols="1,1,3,1",options="header"]
+|===
+|Step
+|Service account
+|What the agent does
+|Writes to the cluster
+
+|Analysis
+|`ls-anl-<run-uid>`
+|Investigates the problem and writes an `AnalysisResult` with a diagnosis and remediation options
+|No
+
+|Execution
+|`ls-exe-<run-uid>`
+|Applies the approved option and writes an `ExecutionResult`
+|Only the approved option's rules
+
+|Verification
+|`ls-ver-<run-uid>`
+|Checks that the fix worked and writes a `VerificationResult`
+|No
+
+|Escalation
+|`ls-esc-<run-uid>`
+|Only after a failed verification: writes an `EscalationResult` report for a human
+|No
+|===
+
+All service accounts live in `openshift-lightspeed` and carry the labels `agentic.openshift.io/run=<run-uid>` and `agentic.openshift.io/component=<step>-sa`. A run therefore uses up to four separate identities, and only the execution identity can change the cluster.
+
+==== The Three Layers of Permissions
+
+Every step's service account receives up to three sets of permissions:
+
+[cols="1,2,3,1",options="header"]
+|===
+|Layer
+|Objects created
+|What it grants
+|Steps
+
+|Read access
+|One `ClusterRoleBinding` `ls-reader-<step>-<run-uid>-<hash>` per source binding (component `reader-rbac`)
+|The operator lists every `ClusterRoleBinding` whose subject is `openshift-lightspeed/lightspeed-agent` (for example `cluster-reader` and `cluster-monitoring-view`) and creates a copy with the same `roleRef`, bound only to the step's account. The shared bindings are never modified, so concurrent runs do not race on them.
+|All
+
+|Own result
+|`Role` and `RoleBinding` `ls-result-<step>-<run-uid>` in `openshift-lightspeed` (component `result-rbac`)
+|`create` on the step's result kind (`analysisresults`, and so on), and `get`, `patch`, `update` on its single result object, by name. The escalation step can also `get` and `list` the other results.
+|All
+
+|Remediation
+|`Role` and `RoleBinding` `ls-exec-<run-uid>` in each namespace of `rbac.namespaceScoped`; `ClusterRole` and `ClusterRoleBinding` `ls-exec-cluster-<run-uid>` for `rbac.clusterScoped` (component `execution-rbac`)
+|Exactly the rules of the approved option, copied as they are. The API group `core` is converted to `""`.
+|Execution
+|===
+
+The bindings on `lightspeed-agent` are templates: that service account is never used by a sandbox pod. The operator discovers them once and caches the list, and if none exists every run fails with `no ClusterRoleBinding found with subject openshift-lightspeed/lightspeed-agent`.
+
+For the option shown in <<Remediation Options and Their RBAC>>, the execution step receives:
+
+[source,yaml]
+----
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ls-exec-<run-uid>
+  namespace: payments                          # <1>
+  labels:
+    agentic.openshift.io/run: <run-uid>
+    agentic.openshift.io/component: execution-rbac
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["reporting-service"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ls-exec-<run-uid>
+  namespace: payments
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ls-exec-<run-uid>
+subjects:
+  - kind: ServiceAccount
+    name: ls-exe-<run-uid>                     # <2>
+    namespace: openshift-lightspeed
+----
+<1> One `Role` per target namespace, holding only the rules for that namespace.
+<2> Only the execution step's service account. The analysis and verification accounts never receive these rules.
+
+As a result:
+
+* *Analysis, verification and escalation are read-only.* Apart from their own result object, they cannot write anything, even if the model tries a command that changes the cluster.
+* *Execution has the reader permissions plus the approved rules, and nothing else.* If the plan needs a verb or a resource that the option did not declare, that call fails with `403`.
+* *Approving and executing are different identities.* Who may approve is ordinary RBAC: `update` on `agenticrunapprovals` in `openshift-lightspeed`. The mutating webhook records the approver in the `AgenticRunApproval`.
+
+==== Who Decides the Scope
+
+The permissions are proposed by the *model*, during analysis, for the specific fix it plans. Each rule must carry a `justification`. The CRD only validates the shape of the rules: at most 20 API groups, 20 resources, 50 resource names and 10 verbs per rule, and a valid namespace name. In the build documented here, no policy engine filters the content: nothing rejects wildcards, `secrets`, or the `escalate`, `bind` and `impersonate` verbs. *The human who approves an option is the control*, and approving an option means approving both its actions and its permissions.
+
+The hard limit is the operator's own identity. Kubernetes RBAC escalation prevention only lets a subject create a `Role` whose permissions it already holds (unless it has `escalate` or `bind`). The operator creates `ls-exec-*` roles with whatever rules were approved, so:
+
+----
+operator's permissions  =  the most any remediation can ever receive
+approved option's rbac  =  what one execution actually receives
+----
+
+This is why the operator runs with `cluster-admin` (see <<ols20-agentic,2.0 Step 3>>). With a narrower ClusterRole, any remediation outside it fails when its `Role` is created:
+
+----
+roles.rbac.authorization.k8s.io is forbidden: user "system:serviceaccount:
+openshift-lightspeed:lightspeed-agentic-operator-controller-manager" is
+attempting to grant RBAC permissions not currently held: ...
+----
+
+==== Lifecycle of the RBAC Objects
+
+----
+step gate passes (ApprovalPolicy or AgenticRunApproval)
+  │
+  ├─▶ create ServiceAccount ls-<step>-<run-uid>
+  ├─▶ copy the lightspeed-agent reader bindings to it
+  ├─▶ execution only: create ls-exec-<run-uid> Roles (and ClusterRole)
+  │                  from the approved option, and record the target
+  │                  namespaces in annotation
+  │                  agentic.openshift.io/rbac-namespaces
+  ├─▶ create Role ls-result-<step>-<run-uid>
+  └─▶ start the sandbox pod as that ServiceAccount
+        │
+        ▼
+  result written, step failed, or run stopped
+        │
+        └─▶ delete the reader bindings, the ls-exec-* objects
+            (execution) and the ServiceAccount
+----
+
+The `ls-result-*` `Role` and `RoleBinding` are owned by the sandbox pod, so Kubernetes garbage-collects them with it. The `rbac-namespaces` annotation lets cleanup find every execution `Role`, even after a retry. Permissions therefore exist only while the step runs: once a run is finished, none of its identities remain.
+
+==== Inspecting the RBAC of a Run
+
+While a run is active:
+
+[source,sh,role=execute]
+----
+RUN_UID=$(oc get agenticrun <run> -n openshift-lightspeed \
+  -o jsonpath='{.metadata.uid}')
+oc get sa -n openshift-lightspeed -l agentic.openshift.io/run=$RUN_UID
+oc get clusterrolebindings -l agentic.openshift.io/run=$RUN_UID
+oc get roles,rolebindings -A -l agentic.openshift.io/run=$RUN_UID
+oc get clusterroles -l agentic.openshift.io/run=$RUN_UID
+----
+
+Check what a step's account can actually do:
+
+[source,sh,role=execute]
+----
+oc auth can-i patch deployments -n payments \
+  --as=system:serviceaccount:openshift-lightspeed:ls-exe-$RUN_UID
+oc auth can-i patch deployments -n payments \
+  --as=system:serviceaccount:openshift-lightspeed:ls-anl-$RUN_UID
+----
+
+==== Hardening Recommendations
+
+* *Keep the reader bindings minimal.* Every step, including execution, inherits them. Binding `cluster-reader` lets every agent read the whole cluster except secrets; bind narrower roles if analysis does not need that.
+* *Keep `Execution` on `Manual`* in the `ApprovalPolicy`, so that every set of write permissions is reviewed by a human.
+* *Restrict who can approve:* grant `update` on `agenticrunapprovals` only to the people allowed to authorize changes.
+* *Review the `rbac` section of an option, not only its summary.* Look for broad verbs, missing `resourceNames`, cluster-scoped rules and sensitive resources (`secrets`, `roles`, `clusterrolebindings`).
+* *Audit:* every RBAC object carries the run label, and the approver is recorded in the `AgenticRunApproval`.
+
+=== Approving with AgenticRunApproval
+
+The operator creates one `AgenticRunApproval` per run. The console's *Execute remediation* button, or `oc agentic run approve`, adds a stage to it:
+
+[source,yaml]
+----
+apiVersion: agentic.openshift.io/v1alpha1
+kind: AgenticRunApproval
+metadata:
+  name: payment-errors
+  namespace: openshift-lightspeed
+spec:
+  stages:
+    - type: Analysis
+      decision: Approved
+      analysis: {}                  # <1>
+    - type: Execution
+      decision: Approved
+      execution:
+        option: 0                   # <2>
+        # agent: smart              # <3>
+  approver:                         # <4>
+    username: admin
+    uid: 1b0c...
+    approvedAt: "2026-10-28T10:15:00Z"
+----
+<1> An empty object approves the step with the run's configured agent.
+<2> 0-based index of the selected remediation option.
+<3> Optional agent override for that step.
+<4> Written by the mutating webhook from the authenticated request. A value submitted by the client is overwritten.
+
+`decision: Denied` on any stage ends the whole run in `Denied`. Who may approve is ordinary RBAC: the `update` verb on `agenticrunapprovals` in `openshift-lightspeed`.
+
+== The Alerts Adapter
+
+The adapter turns firing alerts into `AgenticRun` objects. It runs as service account `lightspeed-agentic-alerts-adapter`, which only has `monitoring-alertmanager-view` in `openshift-monitoring` and `create`/`list`/`get` on `agenticruns`. Its configuration is the ConfigMap referenced by `OLSConfig.spec.ols.deployment.alertsAdapter.configMapRef`:
+
+[source,yaml]
+----
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alerts-adapter-config
+  namespace: openshift-lightspeed
+data:
+  config.yaml: |
+    pollInterval: 30s                  # <1>
+    # preRunDelay: 5m                  # <2>
+    postRunDelay: 1h                   # <3>
+    filtering:
+      allowedReceivers:                # <4>
+        - critical
+    # deduplication:
+    #   ignoredLabels: [pod, instance, endpoint, uid]   # <5>
+    # agent:                           # <6>
+    #   default: default
+    #   analysis: smart
+    analysis:                          # <7>
+      tools:
+        skills:
+          - image: quay.io/openshiftanalytics/agentic-skills:latest
+            paths:
+              - /skills/cluster-troubleshoot/investigate-alert
+    # execution: {tools: ...}
+    # verification: {tools: ...}
+----
+<1> How often Alertmanager (`alertmanager-main.openshift-monitoring.svc:9094`) is polled.
+<2> How long an alert must fire before a run is created, to ignore flapping alerts.
+<3> After a run for an alert ends, how long to wait before creating another run for the same alert.
+<4> Only alerts routed to these Alertmanager receivers create runs. *Empty by default: nothing happens until you list at least one receiver.* Module 1 uncomments `critical`.
+<5> Labels removed before computing an alert's fingerprint, so a restarted pod does not count as a new problem.
+<6> Which `Agent` handles each step of the runs the adapter creates.
+<7> Tools added to the runs, for all steps (`tools:`) or per step.
+
+== How This Lab Deploys Everything
+
+[cols="2,3",options="header"]
+|===
+|Argo CD application (chart)
+|Contents
+
+|`openshift-lightspeed` (`automation/gitops/openshift-lightspeed`)
+|Operator direct install, `llm-credentials`, `OLSConfig`, `alerts-adapter-config`, alerts adapter Deployment and RBAC, in-cluster build of the sandbox image (`BuildConfig sandbox-maas-stream-custom`)
+
+|`openshift-agentic-lightspeed` (`automation/gitops/openshift-agentic-lightspeed`)
+|Agentic CRDs Job, operator Deployment, service account and `cluster-admin` binding, webhook Service and configuration, `lightspeed-agent` reader bindings, `LLMProvider openai`, `llm-creds-openai`, `Agent default` and `smart`, `ApprovalPolicy cluster`, suspension policy
+
+|`openshift-mcp-server`
+|The MCP server Lightspeed calls; see xref:appendix/in-depth/openshift-mcp-server.adoc[In Depth: OpenShift MCP Server]
+
+|`cluster-observability`
+|Cluster Observability Operator, Perses `UIPlugin`, `PersesGlobalDatasource` (Thanos querier), used for inline charts
+|===
+
+The LLM URL, key, provider and model come from the AgnosticV catalog item and flow through the root application (`openshiftAgenticLightspeed.llm`) into both charts. Argo CD ignores live changes to the LLM fields, the `ApprovalPolicy` stages and the adapter ConfigMap, so exercises and BYOM changes are not reverted.
+
+== Operating and Troubleshooting
+
+[cols="2,3",options="header"]
+|===
+|Task
+|Command
+
+|Lightspeed status
+|`oc get olsconfig cluster -o jsonpath='{.status.conditions}' \| jq; oc get pods -n openshift-lightspeed`
+
+|List runs and their phase
+|`oc agentic run list` or `oc get agenticruns -n openshift-lightspeed`
+
+|Follow a run's agent
+|`oc agentic run logs <run>`, or `oc logs -f -n openshift-lightspeed <ls-analysis-...>` while the pod exists
+
+|Logs of finished sandbox pods
+|They are stored in the Lightspeed PostgreSQL database (`templogs.logs` table, column `agentic_run_id`)
+
+|See the RBAC granted to a running execution
+|`oc get roles,rolebindings -A \| grep ls-exec; oc get clusterroles \| grep ls-exec-cluster`
+
+|Re-run a run created from an alert
+|Delete it; the adapter creates a new one at the next poll if the alert still fires and `postRunDelay` allows it
+
+|Stop everything
+|`oc patch agenticolsconfig cluster --type merge -p '{"spec":{"suspended":true}}'`
+|===
+
+Common problems:
+
+* *Runs never appear* — `allowedReceivers` is empty, the alert is routed to another receiver, or `postRunDelay` has not elapsed since the last run for that alert.
+* *Run stays in `Analyzing` until it fails with a timeout* — the model is too slow for the step timeout; raise `Agent.spec.timeouts`.
+* *`no ClusterRoleBinding found with subject .../lightspeed-agent`* — the reader bindings of <<ols20-agentic,2.0 Step 3>> are missing.
+* *Approval rejected* — the webhook is unavailable (`failurePolicy: Fail`); check the operator pod and the `agentic-operator-webhook-certs` secret.

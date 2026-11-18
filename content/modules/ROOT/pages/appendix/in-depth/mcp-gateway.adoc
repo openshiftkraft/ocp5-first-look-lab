@@ -1,0 +1,545 @@
+= In Depth: MCP Gateway (Red Hat Connectivity Link)
+
+include::partial$_attributes.adoc[]
+
+:page-toclevels: 3
+
+This page explains how the MCP Gateway is installed and configured: the operator, the Gateway API resources, the broker and router, server federation, authentication and tool-level authorization with Keycloak, rate limiting and tracing. It is written for engineers who want to reproduce the setup on a fresh cluster.
+
+== What It Does
+
+The MCP Gateway puts *many MCP servers behind one MCP endpoint*, and applies the same traffic policies to MCP that Connectivity Link applies to HTTP APIs:
+
+* *Federation* — a client connects once and sees the tools of every registered server, with a per-server prefix (`inventory_list_products`).
+* *Routing* — each `tools/call` is routed to the server that owns the tool.
+* *Authentication* — every request must carry a valid JWT (Authorino).
+* *Authorization* — each tool call is checked against the caller's roles, per tool (Authorino, CEL).
+* *Rate limiting* — per-user request quotas (Limitador).
+* *Observability* — OpenTelemetry traces of gateway, broker and router.
+
+Backend MCP servers need no security code: the gateway enforces everything in front of them.
+
+== Architecture
+
+----
+MCP client
+  │ HTTPS   Authorization: Bearer <Keycloak JWT>
+  ▼
+Route mcp-gateway.<domain> (edge)
+  ▼
+Gateway mcp-gateway   (namespace openshift-ingress, Envoy)
+├─ listener "mcp"    host mcp-gateway.<domain>
+│    HTTPRoute mcp-gateway-route ──▶ broker
+│    AuthPolicy mcp-gateway-auth       JWT required       (Authorino)
+│    RateLimitPolicy                   30/min per sub     (Limitador)
+│    ext_proc ──▶ router               routes tools/call
+│
+└─ listener "mcps"   host *.mcp.internal
+     HTTPRoute <server>-mcp-route ──▶ inventory / payments / accounts
+     AuthPolicy mcp-tool-auth-policy   tool role in JWT?  (Authorino)
+
+Deployment mcp-gateway (broker + router)   namespace mock-mcp-servers
+Authorino ◀── JWKS ── Keycloak realm "keycloak"
+Gateway, Authorino, Limitador, broker ── OTLP ──▶ Jaeger
+----
+
+[cols="1,3",options="header"]
+|===
+|Component
+|Role
+
+|*MCP Gateway operator*
+|Watches `MCPGatewayExtension` and `MCPServerRegistration`. Deploys the broker-router, creates the broker's `HTTPRoute`, and configures Envoy (an `ext_proc` filter on the targeted Gateway) to call the router.
+
+|*Broker*
+|Implements MCP towards clients: answers `initialize` and `tools/list` with the federated, prefixed list, and keeps a session with every backend server to discover its tools.
+
+|*Router*
+|Envoy external processor. For each `tools/call`, finds the owning server from the prefix, strips the prefix, sets `x-mcp-servername`, `x-mcp-toolname` and `x-mcp-method`, maps the client session to a backend session, and routes the call to the server's internal hostname.
+
+|*Kuadrant* (operator + `Kuadrant` CR)
+|Deploys and wires *Authorino* (authentication, authorization) and *Limitador* (rate limiting) into the Gateway for `AuthPolicy` and `RateLimitPolicy`.
+
+|*Gateway API*
+|`GatewayClass openshift-default`, `Gateway`, `HTTPRoute`, `ReferenceGrant`: listeners, hostnames and backends.
+|===
+
+== Installation on a Fresh Cluster
+
+Replace `<cluster-domain>` with your ingress domain. Keycloak must be installed first (see xref:appendix/in-depth/keycloak.adoc[In Depth: Red Hat Build of Keycloak]).
+
+=== Step 1: Install the Operator
+
+[source,yaml]
+----
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mcp-gateway
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: mcp-gateway
+  namespace: mcp-gateway
+spec: {}                                  # <1>
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: mcp-gateway
+  namespace: mcp-gateway
+spec:
+  name: mcp-gateway                       # <2>
+  channel: preview
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Automatic
+----
+<1> An empty spec means *all namespaces*: the operator manages MCP resources and policies anywhere in the cluster.
+<2> OLM resolves the Kuadrant operator (with Authorino and Limitador) as part of this installation; their pods run in the `mcp-gateway` namespace.
+
+=== Step 2: Activate Policy Enforcement
+
+[source,yaml]
+----
+apiVersion: kuadrant.io/v1beta1
+kind: Kuadrant
+metadata:
+  name: kuadrant
+  namespace: mcp-gateway
+spec:
+  observability:
+    enable: true
+    tracing:
+      defaultEndpoint: http://jaeger.mock-mcp-servers.svc:4318   # <1>
+      insecure: true
+    dataPlane:
+      httpHeaderIdentifier: x-request-id                         # <2>
+----
+<1> OTLP/HTTP endpoint for Authorino and Limitador traces.
+<2> Correlates gateway logs and traces by request ID.
+
+The `Kuadrant` CR makes the Kuadrant operator create an `Authorino` and a `Limitador` instance. Wait for `oc get kuadrant kuadrant -n mcp-gateway -o jsonpath='{.status.conditions}'` to report `Ready`.
+
+The lab then patches the `Limitador` CR to return rate-limit headers (`X-RateLimit-Limit`, `X-RateLimit-Remaining`) to clients:
+
+[source,sh]
+----
+oc patch limitador limitador -n mcp-gateway --type merge -p '{"spec":{"rateLimitHeaders":"DRAFT_VERSION_03"}}'
+----
+
+=== Step 3: Create the Gateway
+
+[source,yaml]
+----
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: openshift-default
+spec:
+  controllerName: openshift.io/gateway-controller/v1     # <1>
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: mcp-gateway
+  namespace: openshift-ingress                           # <2>
+  annotations:
+    networking.istio.io/service-type: ClusterIP          # <3>
+spec:
+  gatewayClassName: openshift-default
+  listeners:
+    - name: mcp                                          # <4>
+      hostname: mcp-gateway.<cluster-domain>
+      port: 80
+      protocol: HTTP
+      allowedRoutes:
+        namespaces: {from: All}
+    - name: mcps                                         # <5>
+      hostname: "*.mcp.internal"
+      port: 80
+      protocol: HTTP
+      allowedRoutes:
+        namespaces: {from: All}
+----
+<1> The OpenShift Gateway API implementation. Creating this `GatewayClass` makes OpenShift provision its Envoy-based gateway controller.
+<2> The OpenShift Gateway API controller manages Gateways in `openshift-ingress`.
+<3> By default the gateway Service is of type `LoadBalancer`. On clusters without a load balancer provider, the Gateway would never be programmed; `ClusterIP` plus a Route avoids that.
+<4> Public listener. The broker's `HTTPRoute` attaches here; clients connect to this hostname.
+<5> Internal listener. One `HTTPRoute` per backend server attaches here with hostname `<server>.mcp.internal`. Tool calls reach the servers through it, which is where per-tool authorization is enforced.
+
+Expose the public listener through the OpenShift router:
+
+[source,yaml]
+----
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: mcp-gateway
+  namespace: openshift-ingress
+spec:
+  host: mcp-gateway.<cluster-domain>
+  to:
+    kind: Service
+    name: mcp-gateway-openshift-default          # <1>
+  port:
+    targetPort: mcp                              # <2>
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+----
+<1> The Service created for the Gateway: `<gateway-name>-<gatewayclass-name>`.
+<2> The Service port named after the listener. The router keeps the `Host` header, so the `mcp` listener hostname still matches.
+
+Finally, allow resources from the servers' namespace to attach to the Gateway:
+
+[source,yaml]
+----
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-mcp-servers
+  namespace: openshift-ingress
+spec:
+  from:
+    - {group: gateway.networking.k8s.io, kind: HTTPRoute,           namespace: mock-mcp-servers}
+    - {group: mcp.kuadrant.io,           kind: MCPGatewayExtension, namespace: mock-mcp-servers}
+    - {group: kuadrant.io,               kind: AuthPolicy,          namespace: mock-mcp-servers}
+  to:
+    - {group: gateway.networking.k8s.io, kind: Gateway}
+----
+
+Without it, the `MCPGatewayExtension` reports a `RefGrantRequired` condition.
+
+=== Step 4: Attach the MCP Broker to the Gateway
+
+[source,yaml]
+----
+apiVersion: mcp.kuadrant.io/v1alpha1
+kind: MCPGatewayExtension
+metadata:
+  name: mock-mcp-extension
+  namespace: mock-mcp-servers                       # <1>
+spec:
+  targetRef:                                        # <2>
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: mcp-gateway
+    namespace: openshift-ingress
+    sectionName: mcp
+  privateHost: "http://mcp-gateway-openshift-default.openshift-ingress.svc.cluster.local:80"   # <3>
+  oauthProtectedResource:                           # <4>
+    authorizationServers:
+      - https://sso.<cluster-domain>/realms/keycloak
+    resourceName: "MCP Gateway"
+    bearerMethodsSupported: [header]
+    scopesSupported: [openid, roles, groups]
+  # backendPingIntervalSeconds: 60                  # <5>
+  # logLevel: info                                  # <6>
+  # sessionStore: {...}                             # <7>
+  # trustedHeadersKey: {...}                        # <8>
+----
+<1> The broker-router Deployment (`mcp-gateway`) is created in this namespace.
+<2> The Gateway listener that receives MCP client traffic. The operator creates the broker's `HTTPRoute` (`mcp-gateway-route`) on it, and configures the Gateway's Envoy to call the router.
+<3> Internal address of the Gateway, used by the broker to send requests back through the Gateway (to the `*.mcp.internal` hostnames). Defaults to `<gateway>-<gatewayclass>.<namespace>.svc.cluster.local:<port>`.
+<4> Published at `/.well-known/oauth-protected-resource`, so MCP clients can discover that Keycloak is the authorization server (MCP authorization specification).
+<5> How often the broker checks backend servers (10–7200 s, default 60).
+<6> `debug`, `info`, `warn` or `error`.
+<7> Redis-backed session store (secret with `CACHE_CONNECTION_STRING`) for several broker replicas; in-memory by default.
+<8> Key pair for signed `x-mcp-authorized` headers, used to filter `tools/list` per user (newer versions).
+
+=== Step 5: Deploy and Register MCP Servers
+
+Each backend server needs a Service, an `HTTPRoute` on the internal listener, and an `MCPServerRegistration`. For the `inventory` mock server:
+
+[source,yaml]
+----
+apiVersion: v1
+kind: Service
+metadata:
+  name: inventory-mcp
+  namespace: mock-mcp-servers
+spec:
+  selector: {app: inventory-mcp}
+  ports:
+    - port: 8080
+      targetPort: 8000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: inventory-mcp-route
+  namespace: mock-mcp-servers
+  labels:
+    mcp-server: 'true'
+spec:
+  parentRefs:
+    - name: mcp-gateway
+      namespace: openshift-ingress                 # <1>
+  hostnames:
+    - inventory.mcp.internal                       # <2>
+  rules:
+    - matches:
+        - path: {type: PathPrefix, value: /}
+      backendRefs:
+        - name: inventory-mcp
+          port: 8080
+---
+apiVersion: mcp.kuadrant.io/v1alpha1
+kind: MCPServerRegistration
+metadata:
+  name: inventory                                  # <3>
+  namespace: mock-mcp-servers
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: inventory-mcp-route                      # <4>
+  prefix: "inventory_"                             # <5>
+  hint: "Warehouse inventory management - products, stock levels, alerts"   # <6>
+  category: [operations]
+  # path: /mcp                                     # <7>
+  # credentialRef: {name: ..., key: ...}           # <8>
+  # state: Enabled                                 # <9>
+----
+<1> No `sectionName`: the route attaches to the listener whose hostname matches, here `mcps`.
+<2> Internal hostname of this server. It never resolves in DNS; Envoy matches it on the `Host` header of hairpinned requests.
+<3> `<namespace>/<name>` of the registration (`mock-mcp-servers/inventory`) is the value of the `x-mcp-servername` header, and therefore the name of this server's Keycloak client.
+<4> The broker discovers the backend URL from the route's backend Service.
+<5> Prepended to every tool, prompt and resource of this server. Immutable; lowercase letters, digits and `_`.
+<6> `hint` and `category` describe the server to the gateway's own `discover_tools` and `select_tools` meta-tools, which is why clients see 17 tools: 15 federated tools plus these 2.
+<7> MCP endpoint path on the server (default `/mcp`).
+<8> Credentials the *broker* uses to connect to a protected server for discovery. Never sent with user tool calls. `oauth2ClientCredentials` is the OAuth alternative.
+<9> `Disabled` removes the server's tools without deleting the registration.
+
+Other registration fields: `caCertSecretRef` (CA for a TLS backend), `userSpecificList: Enabled` (fetch the tool list with the user's credentials on every `tools/list`), `tags`, `tokenURLElicitation`.
+
+[NOTE]
+.The mock servers
+====
+The three lab servers run one generic FastMCP image (`quay.io/jfalkner1/mock-mcp-server`). Each reads `/config/tools.yaml` from its own ConfigMap, which declares the tools, their parameters, and the canned response of each tool:
+
+[source,yaml]
+----
+name: inventory
+description: Warehouse inventory management system
+tools:
+  - name: get_product
+    description: Get detailed information about a specific product by its ID
+    parameters:
+      product_id: {type: string, description: "Product ID (e.g. PRD-001)", required: true}
+    response:
+      id: "PRD-001"
+      name: "Wireless Keyboard"
+      quantity: 342
+----
+====
+
+=== Step 6: Authentication Policy
+
+Attach a JWT `AuthPolicy` to the broker route, so every MCP request needs a valid Keycloak token:
+
+[source,yaml]
+----
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: mcp-gateway-auth
+  namespace: mock-mcp-servers
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: mcp-gateway-route                          # <1>
+  rules:
+    authentication:
+      keycloak-jwt:
+        jwt:
+          issuerUrl: https://sso.<cluster-domain>/realms/keycloak   # <2>
+        credentials:
+          authorizationHeader:
+            prefix: Bearer                           # <3>
+    response:
+      success:
+        filters:
+          identity:
+            json:
+              properties:
+                sub:
+                  expression: auth.identity.sub      # <4>
+----
+<1> The broker's route, created by the operator in the `MCPGatewayExtension` namespace.
+<2> Authorino fetches `<issuerUrl>/.well-known/openid-configuration`, caches the JWKS, and checks signature, expiry and issuer of every token.
+<3> Where to read the token: `Authorization: Bearer <jwt>`.
+<4> Exposes the token's `sub` claim as `auth.identity.sub` to other policies, for the per-user rate limit counter.
+
+Unauthenticated requests receive `401`.
+
+=== Step 7: Tool-Level Authorization Policy
+
+The second `AuthPolicy` targets the *internal* listener, so it applies to every tool call routed to a backend:
+
+[source,yaml]
+----
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: mcp-tool-auth-policy
+  namespace: openshift-ingress
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: mcp-gateway
+    sectionName: mcps                                                    # <1>
+  rules:
+    authentication:
+      keycloak-jwt:
+        jwt:
+          issuerUrl: https://sso.<cluster-domain>/realms/keycloak
+        credentials:
+          authorizationHeader:
+            prefix: Bearer
+    authorization:
+      tool-access-check:
+        when:
+          - predicate: "request.headers.exists(h, h == 'x-mcp-toolname')"  # <2>
+        patternMatching:
+          patterns:
+            - predicate: |                                               # <3>
+                ('tool:' + request.headers['x-mcp-toolname']) in
+                  (has(auth.identity.resource_access) &&
+                   auth.identity.resource_access.exists(p, p == request.headers['x-mcp-servername'])
+                     ? auth.identity.resource_access[request.headers['x-mcp-servername']].roles
+                     : [])
+    response:
+      unauthenticated:
+        headers:
+          WWW-Authenticate:
+            value: "Bearer resource_metadata=https://mcp-gateway.<cluster-domain>/.well-known/oauth-protected-resource/mcp"   # <4>
+        body:
+          value: '{"error": "Unauthorized", "message": "MCP Access denied: Authentication required."}'
+      unauthorized:
+        body:
+          value: '{"error": "Forbidden", "message": "MCP Access denied: Insufficient permissions for this tool."}'
+----
+<1> Only the `mcps` listener, where routed tool calls arrive.
+<2> Only evaluate the rule when the router has identified a tool call.
+<3> CEL expression: the role `tool:<unprefixed tool name>` must be among the roles of the client named `<x-mcp-servername>` in the token's `resource_access` claim. No match, or no claim, means `403`.
+<4> Tells MCP clients where to find the OAuth metadata, so they can start an OAuth flow.
+
+The policy contains no user, team or tool list: *all authorization data lives in Keycloak*. Granting a team access to a tool means mapping one Keycloak client role; see xref:appendix/in-depth/keycloak.adoc#_clients_roles_and_groups_for_the_mcp_gateway[the Keycloak realm model].
+
+=== Step 8: Per-User Rate Limiting
+
+[source,yaml]
+----
+apiVersion: kuadrant.io/v1
+kind: RateLimitPolicy
+metadata:
+  name: mcp-gateway-ratelimit
+  namespace: mock-mcp-servers
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: mcp-gateway-route
+  limits:
+    per-user:
+      rates:
+        - limit: 30                    # <1>
+          window: 1m
+      counters:
+        - expression: auth.identity.sub   # <2>
+----
+<1> 30 requests per minute; further requests receive `429`.
+<2> One counter per Keycloak subject. Without `counters`, the limit would be shared by all users.
+
+Limitador applies the policy after authentication, so the identity is available. Changes to the policy take effect without restarting anything (Module 3, policy hot-reload exercise).
+
+=== Step 9: Tracing
+
+The lab deploys an all-in-one Jaeger (`quay.io/jaegertracing/jaeger:2.20.0`, OTLP/HTTP on 4318, UI on 16686 behind a Route) in `mock-mcp-servers`, points the `Kuadrant` CR at it (step 2), and sets the broker's exporter:
+
+[source,sh]
+----
+oc set env deployment/mcp-gateway -n mock-mcp-servers \
+  OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger.mock-mcp-servers.svc:4318 \
+  OTEL_EXPORTER_OTLP_INSECURE=true
+----
+
+A trace then shows the gateway, Authorino, Limitador, broker and router spans of each MCP request.
+
+== Request Flow in Detail
+
+----
+1. initialize / tools/list   (Authorization: Bearer <JWT>)
+   client ─▶ Route ─▶ listener mcp ─▶ mcp-gateway-route
+     AuthPolicy mcp-gateway-auth: JWT valid?             no ─▶ 401
+     RateLimitPolicy: counter[sub] < 30/min?             no ─▶ 429
+     ─▶ broker answers from its federated tool cache
+        (17 tools, the same list for every user)
+
+2. tools/call inventory_list_products
+   client ─▶ listener mcp ─▶ same authentication and rate limit
+     ext_proc router: prefix inventory_
+       ─▶ server mock-mcp-servers/inventory, tool list_products
+       ─▶ backend session lookup
+       ─▶ headers x-mcp-servername, x-mcp-toolname, x-mcp-method
+     ─▶ routed to inventory.mcp.internal ─▶ listener mcps
+     AuthPolicy mcp-tool-auth-policy:
+       "tool:list_products" in
+       resource_access["mock-mcp-servers/inventory"].roles ?  no ─▶ 403
+     ─▶ HTTPRoute inventory-mcp-route ─▶ Service inventory-mcp ─▶ pod
+----
+
+Notes:
+
+* `tools/list` is *not* filtered per user: authorization happens on `tools/call`. Newer versions can filter the list with signed `x-mcp-authorized` headers (`trustedHeadersKey`) and curate subsets with `MCPVirtualServer` resources.
+* The router keeps a mapping `gateway session → backend session` per server, so backend servers see normal, stateful MCP sessions.
+* The user's `Authorization` header travels with the routed call, which is how the second `AuthPolicy` can read the JWT again.
+
+== Adding a New MCP Server
+
+. Deploy the server and a Service.
+. Create an `HTTPRoute` with hostname `<name>.mcp.internal` attached to the Gateway.
+. Create an `MCPServerRegistration` with a unique `prefix`.
+. In Keycloak, create a client named `<namespace>/<registration-name>`, one client role `tool:<tool>` per tool (unprefixed names), and map the roles to the groups that may use them.
+. Users request a new token to receive the new roles.
+
+No change is needed to the Gateway, the `MCPGatewayExtension` or either `AuthPolicy`.
+
+== Operating and Troubleshooting
+
+[cols="2,3",options="header"]
+|===
+|Task
+|Command
+
+|Overall status
+|`oc get mcpgatewayextension,mcpserverregistration -n mock-mcp-servers; oc get gateway mcp-gateway -n openshift-ingress`
+
+|Policy status (accepted, enforced)
+|`oc get authpolicy,ratelimitpolicy -A -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,COND:.status.conditions[*].type,STATUS:.status.conditions[*].status`
+
+|Broker discovery logs
+|`oc logs deploy/mcp-gateway -n mock-mcp-servers \| grep -E "Registering\|Discovered"`
+
+|List federated tools
+|`fastmcp list https://mcp-gateway.<cluster-domain>/mcp --auth "$TOKEN"`
+
+|Call a tool
+|`fastmcp call https://mcp-gateway.<cluster-domain>/mcp inventory_list_products --auth "$TOKEN"`
+
+|Kuadrant health
+|`oc get kuadrant kuadrant -n mcp-gateway -o jsonpath='{.status.conditions}' \| jq`
+|===
+
+Common problems:
+
+* *Gateway not programmed* — no load balancer provider and no `networking.istio.io/service-type: ClusterIP` annotation.
+* *`Kuadrant` not ready (`LimitadorNotReady`)* — the Kuadrant operator can fail to create `Limitador` at startup and not retry; restarting the `kuadrant-operator-controller-manager` pod in `mcp-gateway` makes it reconcile again. Policies stay unenforced until Kuadrant is ready.
+* *A server's tools are missing* — the `HTTPRoute` is not accepted (missing `ReferenceGrant`), the backend does not answer on `path`, or the registration is `Disabled`.
+* *`401` with a fresh token* — the token's `iss` differs from `issuerUrl`.
+* *`403` on an expected tool* — Keycloak client name ≠ `<namespace>/<registration>`, role name ≠ `tool:<unprefixed tool>`, or the token was issued before the role mapping.
