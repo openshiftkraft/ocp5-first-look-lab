@@ -64,7 +64,7 @@ mcpServers:
 
 === The Agentic Layer
 
-* *Agentic operator* `lightspeed-agentic-operator` — watches `AgenticRun` resources and drives each one through analysis, execution and verification. Each step runs in an *ephemeral sandbox pod* that hosts the LLM-backed agent and is deleted when the step ends.
+* *Agentic operator* `lightspeed-agentic-operator-controller-manager`, bundled with the Lightspeed 2.0 operator — watches `AgenticRun` resources and drives each one through analysis, execution and verification. Each step runs in an *ephemeral sandbox pod* that hosts the LLM-backed agent and is deleted when the step ends.
 * *Alerts adapter* `lightspeed-agentic-alerts-adapter` — polls Alertmanager every 30 seconds and creates an `AgenticRun` for each new firing alert routed to an allowed receiver. It is configured by the `alerts-adapter-config` ConfigMap.
 * *Agentic console* — the *Agentic Runs* pages in the OpenShift console, and the `oc agentic` CLI plugin.
 

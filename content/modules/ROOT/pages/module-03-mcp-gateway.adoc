@@ -544,7 +544,7 @@ The AI automatically discovers tools, selects the right one for each query, and 
 * Tool calls use hairpin routing through the gateway — the backend session is established via the gateway's internal service
 * HTTPS on the Gateway listener itself requires a wildcard TLS certificate which ACME providers reject for deeply nested OpenShift domains — TLS is instead terminated at the OpenShift router, through an edge Route in front of the gateway
 * Rate limit `Retry-After` header is not natively supported — use `x-ratelimit-reset` from the IETF draft-03 headers instead
-* Broker-level Prometheus metrics (`mcp_broker_*`) are not available in the Red Hat tech preview build
+* Broker-level Prometheus metrics (`mcp_broker_*`) are exposed on the broker's internal port 9090, but this lab does not scrape them
 
 == Key Takeaways
 

@@ -68,7 +68,7 @@ NOTE: The OpenShift MCP Server from the previous module is *not* behind this gat
 
 Resources in the `mcp-gateway` and `openshift-ingress` namespaces:
 
-* *MCP Gateway operator* (Red Hat Connectivity Link), installed through OLM.
+* *Red Hat Connectivity Link 1.5 operator*, installed through OLM. Its `KuadrantControlPlane` `default` deploys the MCP gateway controller alongside the Authorino, Limitador and DNS controllers.
 * *`Kuadrant` CR* — activates the policy engines: *Authorino* (authentication and authorization) and *Limitador* (rate limiting). It also sends traces to Jaeger.
 * *`Gateway`* `mcp-gateway` in `openshift-ingress`, implemented by Envoy through the `openshift-default` GatewayClass. It has two listeners:
 ** `mcp` — hostname `mcp-gateway.<cluster-domain>`, the public entry point, exposed through an edge-terminated Route.

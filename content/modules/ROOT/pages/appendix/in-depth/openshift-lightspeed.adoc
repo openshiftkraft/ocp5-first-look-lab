@@ -196,7 +196,6 @@ apiVersion: agentic.openshift.io/v1alpha1
 kind: LLMProvider
 metadata:
   name: openai
-  namespace: openshift-lightspeed
 spec:
   type: OpenAI
   openAI:
@@ -214,7 +213,6 @@ apiVersion: agentic.openshift.io/v1alpha1
 kind: Agent
 metadata:
   name: default
-  namespace: openshift-lightspeed
 spec:
   llmProvider:
     name: openai
@@ -229,7 +227,7 @@ spec:
 EOF
 ----
 +
-NOTE: The 2.0 manifests set `metadata.namespace` on `LLMProvider` and `Agent`, while the development build described in <<Configuring the Agentic Resources>> defines them as cluster-scoped. Check the scope on your cluster with `oc api-resources --api-group=agentic.openshift.io`.
+NOTE: `LLMProvider`, `Agent` and `ApprovalPolicy` are cluster-scoped, so they have no `metadata.namespace`. Their credential secrets are always read from `openshift-lightspeed`.
 
 . *(Optional) Create the `ApprovalPolicy`.* Without a policy, every step defaults to `Manual` except `Escalation`, so each step waits for your approval. The policy below approves analysis, verification and escalation automatically, and only execution needs a manual approval:
 +
@@ -258,7 +256,7 @@ EOF
 +
 [IMPORTANT]
 ====
-In v2.0.0 the operator does *not* create these `ClusterRoleBinding` objects. The OLM bundle creates the `lightspeed-agent` service account but not its bindings; only the upstream quickstart script (`hack/quickstart/deploy-operator.sh`) creates them. The agentic controller looks for existing bindings whose subject is `lightspeed-agent`. Without them, every `AgenticRun` fails immediately with:
+In v2.0.1 the operator does *not* create these `ClusterRoleBinding` objects. The OLM bundle creates the `lightspeed-agent` service account but not its bindings; only the upstream quickstart script (`hack/quickstart/deploy-operator.sh`) creates them. The agentic controller looks for existing bindings whose subject is `lightspeed-agent`. Without them, every `AgenticRun` fails immediately with:
 
 ----
 claim sandbox: add subject to reader ClusterRoleBinding: no ClusterRoleBinding
@@ -533,7 +531,7 @@ Dataverse export: a sidecar reads the traces for Red Hat telemetry
 In a test, one successful `AgenticRun` produced 2,276 log rows in PostgreSQL and 23 OTEL trace spans.
 
 [#ols20-known-issues]
-=== Known Issues in v2.0.0
+=== Known Issues in v2.0.1
 
 [cols="1,3",options="header"]
 |===
@@ -1097,10 +1095,10 @@ data:
 |Contents
 
 |`openshift-lightspeed` (`automation/gitops/openshift-lightspeed`)
-|Operator direct install, `llm-credentials`, `OLSConfig`, `alerts-adapter-config`, alerts adapter Deployment and RBAC, in-cluster build of the sandbox image (`BuildConfig sandbox-maas-stream-custom`)
+|`OperatorGroup` and `Subscription` for Lightspeed 2.0 (`lightspeed-operator`, channel `stable`, `redhat-operators`), `llm-credentials`, `OLSConfig`, `alerts-adapter-config`. The operator deploys the agentic operator, agentic console, alerts adapter and the stock sandbox image itself.
 
 |`openshift-agentic-lightspeed` (`automation/gitops/openshift-agentic-lightspeed`)
-|Agentic CRDs Job, operator Deployment, service account and `cluster-admin` binding, webhook Service and configuration, `lightspeed-agent` reader bindings, `LLMProvider openai`, `llm-creds-openai`, `Agent default` and `smart`, `ApprovalPolicy cluster`, suspension policy
+|`cluster-admin` binding for `lightspeed-agentic-operator-controller-manager`, `lightspeed-agent` reader bindings, `LLMProvider openai`, `llm-creds-openai`, `Agent default` and `smart`, `ApprovalPolicy cluster`, suspension policy
 
 |`openshift-mcp-server`
 |The MCP server Lightspeed calls; see xref:appendix/in-depth/openshift-mcp-server.adoc[In Depth: OpenShift MCP Server]

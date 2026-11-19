@@ -48,8 +48,8 @@ Gateway, Authorino, Limitador, broker ── OTLP ──▶ Jaeger
 |Component
 |Role
 
-|*MCP Gateway operator*
-|Watches `MCPGatewayExtension` and `MCPServerRegistration`. Deploys the broker-router, creates the broker's `HTTPRoute`, and configures Envoy (an `ext_proc` filter on the targeted Gateway) to call the router.
+|*MCP Gateway controller*
+|Part of Red Hat Connectivity Link 1.5 (deployment `mcp-gateway-controller` in `mcp-gateway`, deployed by the `KuadrantControlPlane`). Watches `MCPGatewayExtension` and `MCPServerRegistration`. Deploys the broker-router, creates the broker's `HTTPRoute`, and configures Envoy (an `ext_proc` filter on the targeted Gateway) to call the router.
 
 |*Broker*
 |Implements MCP towards clients: answers `initialize` and `tools/list` with the federated, prefixed list, and keeps a session with every backend server to discover its tools.
@@ -87,17 +87,29 @@ spec: {}                                  # <1>
 apiVersion: operators.coreos.com/v1alpha1
 kind: Subscription
 metadata:
-  name: mcp-gateway
+  name: rhcl-operator
   namespace: mcp-gateway
 spec:
-  name: mcp-gateway                       # <2>
-  channel: preview
+  name: rhcl-operator                     # <2>
+  channel: stable-1.5
   source: redhat-operators
   sourceNamespace: openshift-marketplace
   installPlanApproval: Automatic
 ----
 <1> An empty spec means *all namespaces*: the operator manages MCP resources and policies anywhere in the cluster.
-<2> OLM resolves the Kuadrant operator (with Authorino and Limitador) as part of this installation; their pods run in the `mcp-gateway` namespace.
+<2> Red Hat Connectivity Link 1.5 is a single operator. When it starts, it creates a `KuadrantControlPlane` named `default`, which deploys the Authorino, Limitador, DNS, developer portal and *MCP gateway* controllers in the `mcp-gateway` namespace. There is no separate MCP gateway package to install.
+
+Wait for the control plane to report its components healthy:
+
+[source,sh]
+----
+oc get kuadrantcontrolplane default -n mcp-gateway
+----
+
+----
+NAME      READY   REASON
+default   True    ComponentsHealthy
+----
 
 === Step 2: Activate Policy Enforcement
 
@@ -216,7 +228,7 @@ Without it, the `MCPGatewayExtension` reports a `RefGrantRequired` condition.
 
 [source,yaml]
 ----
-apiVersion: mcp.kuadrant.io/v1alpha1
+apiVersion: mcp.kuadrant.io/v1
 kind: MCPGatewayExtension
 metadata:
   name: mock-mcp-extension
@@ -286,7 +298,7 @@ spec:
         - name: inventory-mcp
           port: 8080
 ---
-apiVersion: mcp.kuadrant.io/v1alpha1
+apiVersion: mcp.kuadrant.io/v1
 kind: MCPServerRegistration
 metadata:
   name: inventory                                  # <3>
@@ -534,6 +546,12 @@ No change is needed to the Gateway, the `MCPGatewayExtension` or either `AuthPol
 
 |Kuadrant health
 |`oc get kuadrant kuadrant -n mcp-gateway -o jsonpath='{.status.conditions}' \| jq`
+
+|Control plane components (Authorino, Limitador, DNS, MCP gateway)
+|`oc get kuadrantcontrolplane default -n mcp-gateway -o jsonpath='{.status.conditions}' \| jq`
+
+|Broker metrics (`mcp_broker_*`, internal port 9090, not scraped by the lab)
+|`oc exec deploy/mcp-gateway -n mock-mcp-servers -- curl -s localhost:9090/metrics \| grep ^mcp_broker`
 |===
 
 Common problems:

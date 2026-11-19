@@ -41,25 +41,25 @@ Tools are grouped in *toolsets*. This environment enables:
 |Examples of tools
 
 |`core`
-|Generic resources (`resources_list`, `resources_get`, `resources_create_or_update`, `resources_delete`), pods (`pods_list`, `pods_get`, `pods_log`, `pods_exec`, `pods_run`, `pods_delete`, `pods_top`), `events_list`, `namespaces_list`, `nodes_top`
+|Generic resources (`resources_list`, `resources_get`, `resources_create_or_update`, `resources_delete`, `resources_scale`), pods (`pods_list`, `pods_list_in_namespace`, `pods_get`, `pods_log`, `pods_exec`, `pods_run`, `pods_delete`, `pods_top`), `events_list`, `namespaces_list`, `projects_list`, nodes (`nodes_top`, `nodes_log`, `nodes_stats_summary`)
 
 |`config`
-|Kubeconfig contexts (`configuration_contexts_list`; `configuration_view` is disabled in HTTP mode)
+|Kubeconfig contexts. With token passthrough in HTTP mode it exposes no tools, so the lab's tool list has none.
 
-|`openshift`
-|OpenShift-specific resources such as projects
-
-|`metrics`
-|PromQL queries against the Thanos querier (instant and range queries, alerts)
+|`observability/metrics`
+|PromQL against the Thanos querier: `list_metrics`, `execute_instant_query`, `execute_range_query`, `show_timeseries`, `get_series`, `get_label_names`, `get_label_values`, `get_alerts`, `get_silences`
 
 |`netedge`
-|Network diagnostics for ingress, DNS and OVN-Kubernetes, including predefined Prometheus queries
+|Network diagnostics for ingress, DNS and OVN-Kubernetes: `inspect_route`, `get_router_config`, `get_router_info`, `get_router_sessions`, `get_coredns_config`, `get_service_endpoints`, `probe_dns_local`, `probe_http`, `exec_dns_in_pod`, `netedge_query_prometheus`
+
+|`openshift/mustgather`
+|Offline analysis of a must-gather archive (`mustgather_*`): events, pod and kubelet logs, node diagnostics, etcd health, Prometheus alerts, rules and targets
 
 |`ossm`
 |OpenShift Service Mesh through Kiali: mesh status, traffic graph, Istio configuration and validations, traces, `ossm_manage_istio_config` (create, patch, delete Istio and Gateway API objects)
 |===
 
-Each tool carries MCP *annotations* such as `readOnlyHint` and `destructiveHint`. The server uses them to filter tools (`read_only`, `disable_destructive`); clients use them to decide which calls need human approval (Lightspeed's `tool_annotations` approval mode). Newer upstream versions rename or split some toolsets (for example `observability/metrics`) and add others (`helm`, `kubevirt`, `tekton`, `oadp`, `ovn-kubernetes`, `cluster-diagnostics`).
+Each tool carries MCP *annotations* such as `readOnlyHint` and `destructiveHint`. The server uses them to filter tools (`read_only`, `disable_destructive`); clients use them to decide which calls need human approval (Lightspeed's `tool_annotations` approval mode). With these toolsets the server lists 67 tools, 59 of them read-only. Version 1.0 also offers `helm`, `kubevirt`, `tekton`, `oadp`, `ovn-kubernetes`, `cni-diagnostics`, `cluster-diagnostics`, `netobserv`, `observability/logs`, `observability/traces` and `observability/otelcol`; earlier versions named the metrics and must-gather toolsets `metrics` and `openshift`.
 
 == Installation on a Fresh Cluster
 
@@ -106,10 +106,11 @@ metadata:
   namespace: openshift-mcp
 data:
   config.toml: |
-    toolsets = ["core", "config", "metrics", "netedge", "openshift", "ossm"]   # <1>
+    toolsets = ["core", "config", "observability/metrics", "netedge", "openshift/mustgather", "ossm"]   # <1>
     log_level = 0                                                              # <2>
     port = "8080"                                                              # <3>
     read_only = false                                                          # <4>
+    disable_destructive = false                                                # <12>
     cluster_auth_mode = "passthrough"                                          # <5>
     skip_jwt_verification = true                                               # <6>
     server_instructions = """                                                 # <7>
@@ -118,20 +119,16 @@ data:
     about the consequences and ask for explicit confirmation. ...
     """
 
-    [toolset_configs.metrics]
+    [toolset_configs."observability/metrics"]
     prometheus_url = "https://thanos-querier.openshift-monitoring.svc.cluster.local:9091"   # <8>
     insecure = true                                                                          # <9>
     auth_mode = "header"                                                                     # <10>
-
-    [toolset_configs.netedge]
-    auth_mode = "header"
-    insecure = true
 
     [toolset_configs.kiali]
     url = "https://kiali.istio-system.svc.cluster.local:20001"                               # <11>
     insecure = true
 ----
-<1> Toolsets to expose. Fewer toolsets means a smaller tool list in the LLM prompt and better tool selection.
+<1> Toolsets to expose. Fewer toolsets means a smaller tool list in the LLM prompt and better tool selection. Version 1.0 rejects unknown toolset names and unknown `toolset_configs` sections (such as `netedge`) at startup.
 <2> Verbosity from 0 to 9. Level 5 and above log tool calls; tokens are redacted.
 <3> Setting `port` starts the server in *HTTP mode* (Streamable HTTP at `/mcp`). Without it, the server speaks MCP over stdio, for local use.
 <4> `true` exposes only tools annotated `readOnlyHint=true`, for every caller, whatever their RBAC (Module 2, Exercise 8 sets it with the `--read-only` flag).
@@ -142,6 +139,7 @@ data:
 <9> Skip TLS verification of the Thanos certificate (signed by the service CA). Mount the service CA bundle instead for production.
 <10> `header`: send the *caller's* token to Thanos. Prometheus queries are then authorized per user: the caller needs `cluster-monitoring-view` (or namespace-level monitoring access).
 <11> Kiali endpoint for the `ossm` toolset. Kiali also receives the caller's token.
+<12> Version 1.0 defaults to `true`, which hides tools annotated `destructiveHint=true` (`pods_delete`, `pods_exec`, `resources_delete`, `resources_scale`, ...). The lab sets `false` so that the safety exercises of Module 2 have write tools to work with.
 
 ==== Other Configuration Options
 
@@ -151,7 +149,7 @@ data:
 |Effect
 
 |`disable_destructive`
-|Hide tools annotated `destructiveHint=true` (deletes, updates) while keeping creation and reads.
+|Hide tools annotated `destructiveHint=true` (deletes, updates). Default `true` in version 1.0.
 
 |`enabled_tools`, `disabled_tools`
 |Allowlist, then denylist, of individual tool names, applied after toolsets.
@@ -206,7 +204,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: openshift-mcp-server
-          image: registry.redhat.io/openshift-mcp-tech-preview/openshift-mcp-server-rhel9:0.3
+          image: registry.redhat.io/openshift-mcp/openshift-mcp-server-rhel9:1.0
           command: ["/openshift-mcp-server"]
           args: ["--config", "/etc/mcp/config.toml"]        # <1>
           ports:
@@ -249,7 +247,7 @@ spec:
     termination: edge
     insecureEdgeTerminationPolicy: Redirect
 ----
-<1> Command-line flags override the file, for example `--read-only` or `--toolsets core,metrics`.
+<1> Command-line flags override the file, for example `--read-only` or `--toolsets core,observability/metrics`.
 <2> Only needed for clients outside the cluster network. Lightspeed and in-cluster agents use the Service.
 
 === Step 4: Users and RBAC

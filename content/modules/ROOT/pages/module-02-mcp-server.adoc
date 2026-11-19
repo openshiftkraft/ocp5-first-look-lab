@@ -14,6 +14,7 @@ Your environment includes an *OpenShift MCP Server* that provides tools for quer
 * *Metrics* — query Prometheus for CPU, memory, and custom metrics via PromQL
 * *Config* — manage kubeconfig contexts for multi-cluster operations
 * *NetEdge* — diagnose OVN networking issues on nodes
+* *Must-gather* — analyze must-gather archives offline (events, pod and kubelet logs, etcd and Prometheus status)
 * *OSSM* — query and manage OpenShift Service Mesh / Istio via Kiali (mesh health, traffic graphs, tracing, Istio config management)
 
 The server implements the MCP specification, allowing any MCP-compatible client (opencode, Claude Desktop, Cursor, VS Code, MCP Inspector, or custom agents) to connect and use cluster tools. RBAC is enforced — the MCP server respects the user's OpenShift permissions, so a read-only user cannot delete resources even through the AI.
@@ -391,7 +392,7 @@ oc patch deployment openshift-mcp-server -n openshift-mcp \
 oc rollout status deployment openshift-mcp-server -n openshift-mcp --timeout=120s
 ----
 +
-In read-only mode, write tools are *hidden entirely*, not just blocked. This applies to all toolsets including OSSM (e.g., `ossm_manage_istio_config` also disappears). The tool count drops from 49 to approximately 41.
+In read-only mode, write tools are *hidden entirely*, not just blocked. This applies to all toolsets including OSSM (e.g., `ossm_manage_istio_config` also disappears). The tool count drops from 67 to 59.
 
 . Start opencode again. MCP clients load the tool list when they connect, so a new session picks up the reduced tool set:
 +

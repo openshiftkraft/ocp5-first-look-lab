@@ -39,7 +39,7 @@ opencode resolves `{env:OPENSHIFT_MCP_TOKEN}` when it starts. That is why the ex
 
 All resources live in the `openshift-mcp` namespace.
 
-* *Deployment* `openshift-mcp-server` — the OpenShift MCP Server (tech preview image), exposed in-cluster by a Service on port 8080 and externally by an edge-terminated Route at `mcp-server.<cluster-domain>`.
+* *Deployment* `openshift-mcp-server` — the OpenShift MCP Server 1.0, exposed in-cluster by a Service on port 8080 and externally by an edge-terminated Route at `mcp-server.<cluster-domain>`.
 * *ConfigMap* `mcp-config` — the server configuration (`config.toml`).
 * *Setup Job* `mcp-server-keycloak-setup` — creates the `mcp-admin` and `mcp-viewer` users in Keycloak with random passwords, and stores those passwords in the `mcp-user-credentials` secret.
 * *ClusterRoleBindings* — one per lab user, binding the OpenShift `User` of the same name to a cluster role.
@@ -48,19 +48,21 @@ All resources live in the `openshift-mcp` namespace.
 
 [source,toml]
 ----
-toolsets = ["core","config","metrics","netedge","openshift","ossm"]
+toolsets = ["core","config","observability/metrics","netedge","openshift/mustgather","ossm"]
 read_only = false
+disable_destructive = false
 cluster_auth_mode = "passthrough"
 skip_jwt_verification = true
 
-[toolset_configs.metrics]
+[toolset_configs."observability/metrics"]
 auth_mode = "header"
 ----
 
 `toolsets`:: Which groups of tools the server exposes. Every client sees the same tool list, whoever the user is.
+`disable_destructive = false`:: Version 1.0 hides destructive tools (delete, exec, scale, create) by default. The lab turns them back on for the safety exercises (Exercise 7).
 `cluster_auth_mode = "passthrough"`:: The server does not act with its own identity. It forwards the caller's bearer token to the Kubernetes API for every operation.
 `skip_jwt_verification = true`:: The server does not validate the token itself. The Kubernetes API server validates it (and rejects it with `401` if it is invalid or expired).
-`auth_mode = "header"` (metrics, netedge):: The caller's token is also forwarded to Thanos/Prometheus. This is why PromQL queries require the user to have `cluster-monitoring-view` access.
+`auth_mode = "header"` (metrics)::The caller's token is also forwarded to Thanos/Prometheus. This is why PromQL queries require the user to have `cluster-monitoring-view` access.
 `read_only`:: A server-wide switch. When enabled (Exercise 8), write tools are removed from the tool list for *everyone*, including cluster administrators.
 
 The ConfigMap also sets `server_instructions`, asking the AI to warn and request confirmation before destructive operations (Exercise 7). These instructions are guidance for the model — they are not an enforcement mechanism.

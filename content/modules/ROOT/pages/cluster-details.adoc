@@ -16,18 +16,19 @@ or troubleshooting.
 
 == OpenShift Lightspeed
 
-* *OLS Operator* — installed directly (not via OLM) from upstream kustomize manifests
+* *OpenShift Lightspeed operator 2.0* — installed from OperatorHub (`lightspeed-operator`, channel `stable`). It bundles classic OLS and the agentic operator, agentic console and alerts adapter.
 * *OLSConfig* CR configures the classic AI assistant with:
 ** Default LLM provider and model (configurable via BYOM appendix)
 ** MCP server integration for tool-augmented responses
 ** PostgreSQL conversation cache
 ** OTEL collector for audit logging
-* *Agentic Operator* — deployed alongside OLS for automated cluster operations
-** Agent CR (`default`) with configurable LLM provider
+* *Agentic Operator* — installed by the Lightspeed operator for automated cluster operations
+** Agent CRs (`default` and `smart`) with configurable LLM provider
 ** LLMProvider CR for model credentials
 ** ApprovalPolicy CR for execution gate control
 ** Agentic console plugin for UI-driven troubleshooting
-** CRDs installed via a sync Job from upstream GitHub
+** Alerts adapter, configured through the `alerts-adapter-config` ConfigMap
+** Reader bindings for the `lightspeed-agent` service account, and a `cluster-admin` binding for the agentic controller, which the operator does not create
 
 == Red Hat Advanced Cluster Security (ACS) 5
 
@@ -53,7 +54,8 @@ or troubleshooting.
 
 == MCP Gateway (Red Hat Connectivity Link)
 
-* *Connectivity Link operator* (Kuadrant) installed from OperatorHub
+* *Red Hat Connectivity Link 1.5 operator* (`rhcl-operator`, channel `stable-1.5`) installed from OperatorHub
+* *KuadrantControlPlane* `default`, created by the operator, deploys the Authorino, Limitador, DNS, developer portal and MCP gateway controllers
 * *Kuadrant CR* activates policy enforcement (Authorino + Limitador)
 
 === Federated Gateway (`mock-mcp-servers` namespace)
