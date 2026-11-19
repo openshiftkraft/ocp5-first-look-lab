@@ -1,7 +1,8 @@
 namespace: openshift-mcp
 clusterSubdomain: ""
 name: openshift-mcp-server
-image: registry.redhat.io/openshift-mcp-tech-preview/openshift-mcp-server-rhel9:0.3
+# OpenShift MCP Server 1.0 (GA), tag 1.0 pinned by digest
+image: registry.redhat.io/openshift-mcp/openshift-mcp-server-rhel9@sha256:c6e59e791a0b934c5a33bf93e29e45b168ba81625f959794fecbdbf657996ac2
 
 toolsets:
   - core
