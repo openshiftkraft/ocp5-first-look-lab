@@ -1,7 +1,9 @@
+# Red Hat Connectivity Link 1.5 (GA) bundles Authorino, Limitador, DNS and the
+# MCP gateway operator. It replaces the mcp-gateway 0.7 preview package.
 subscription:
-  channel: preview
+  channel: stable-1.5
   installPlanApproval: Automatic
-  name: mcp-gateway
+  name: rhcl-operator
   source: redhat-operators
   sourceNamespace: openshift-marketplace
 
