@@ -17,7 +17,7 @@ spec:
           source: redhat-operators
         tempo:
           subscription:
-            source: {{ .Values.catalogSource.name }}
+            source: {{ include "app-of-apps.operatorSource" . }}
   ignoreDifferences:
   - group: networking.istio.io
     kind: VirtualService

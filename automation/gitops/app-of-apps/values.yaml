@@ -6,9 +6,11 @@ gitops:
 argocd:
   namespace: openshift-gitops
 
-# OLM catalog snapshot — v5.0 index dropped several operators we depend on
+# OLM catalog snapshot. Not used by the lab any more: every operator now comes
+# from the GA OpenShift 5 "redhat-operators" catalog. Kept only because the
+# OpenShift GitOps operator (installed by AgnosticD) may still subscribe to it.
 catalogSource:
-  enabled: true
+  enabled: false
   name: redhat-operators-v422
   namespace: openshift-marketplace
   image: quay.io/rhpds/olm_snapshot_redhat_catalog

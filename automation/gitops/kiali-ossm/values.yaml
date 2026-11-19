@@ -9,7 +9,7 @@ tempo:
   operatorNamespace: openshift-tempo-operator
   namespace: tempo
   subscription:
-    source: redhat-operators-v422
+    source: redhat-operators
 
 istio:
   namespace: istio-system

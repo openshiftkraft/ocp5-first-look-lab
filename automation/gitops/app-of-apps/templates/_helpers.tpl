@@ -21,15 +21,11 @@ syncPolicy:
 
 {{/*
 Returns the operator catalog source name.
-When catalog snapshot is enabled, returns the custom CatalogSource name;
-otherwise returns "redhat-operators".
+All operators come from the GA "redhat-operators" catalog of OpenShift 5.
+The 4.22 snapshot (catalogSource) is no longer used by any subscription.
 */}}
 {{- define "app-of-apps.operatorSource" -}}
-{{- if .Values.catalogSource.enabled -}}
-{{ .Values.catalogSource.name }}
-{{- else -}}
 redhat-operators
-{{- end -}}
 {{- end -}}
 
 {{/*
