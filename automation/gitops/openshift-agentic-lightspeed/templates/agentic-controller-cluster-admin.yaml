@@ -1,0 +1,21 @@
+{{- if .Values.agentic.enabled }}
+---
+# The analysis step proposes RBAC for the execution sandbox in any API group,
+# and Kubernetes only lets the operator grant permissions it holds itself.
+# The ClusterRole OLM grants to the agentic controller is too narrow, so
+# cluster-admin is the only reliable option in Lightspeed 2.0.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: lightspeed-agentic-controller-cluster-admin-extra
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: lightspeed-agentic-operator-controller-manager
+    namespace: {{ .Values.namespace }}
+{{- end }}

@@ -1,5 +1,5 @@
 apiVersion: v2
 name: openshift-agentic-lightspeed
-description: OpenShift Agentic Lightspeed configuration and operator
+description: OpenShift Agentic Lightspeed configuration (operator bundled with Lightspeed 2.0)
 type: application
 version: 0.1.0

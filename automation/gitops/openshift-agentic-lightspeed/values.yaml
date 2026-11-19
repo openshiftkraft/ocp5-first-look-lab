@@ -16,6 +16,3 @@ mcpServer:
 
 agentic:
   enabled: true
-  # :main as of 2026-10-16 (vcs-ref 14da92cf) — needs the batch-mode sandbox (/input), e.g. sandbox-maas
-  operatorImage: quay.io/redhat-user-workloads/crt-nshift-lightspeed-tenant/lightspeed-agentic-operator@sha256:7daec7bd2a06b0546320e467b6d80e829d7e858873f028a49ca4614abab94f89
-  githubRaw: https://raw.githubusercontent.com/openshift/lightspeed-agentic-operator/14da92cf6efa835aff5b7e395aeced682870903b
