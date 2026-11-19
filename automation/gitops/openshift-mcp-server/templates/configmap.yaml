@@ -10,6 +10,8 @@ data:
     log_level = 0
     port = "8080"
     read_only = false
+    # 1.0 hides destructive tools (delete, exec, scale, create) by default
+    disable_destructive = false
     cluster_auth_mode = "passthrough"
     skip_jwt_verification = true
     server_instructions = """
