@@ -4,8 +4,7 @@ kind: Application
 {{ include "app-of-apps.metadata" (dict "name" "openshift-lightspeed" "namespace" .Values.argocd.namespace "syncWave" "1") }}
 spec:
   ignoreDifferences:
-    - group: ""
-      kind: ConfigMap
+    - kind: ConfigMap
       name: alerts-adapter-config
       jsonPointers:
         - /data
@@ -18,18 +17,10 @@ spec:
         - /spec/ols/defaultProvider
         - /spec/ols/defaultModel
         - /spec/ols/toolsApprovalConfig
-    - group: ""
-      kind: Secret
+    - kind: Secret
       name: llm-credentials
       jsonPointers:
         - /data
-    - group: apps
-      kind: Deployment
-      name: lightspeed-agentic-alerts-adapter
-      jsonPointers:
-        - /spec/selector
-        - /spec/template/metadata/labels
-        - /spec/template/spec
   destination:
     namespace: {{ .Values.openshiftAgenticLightspeed.namespace }}
     server: https://kubernetes.default.svc
