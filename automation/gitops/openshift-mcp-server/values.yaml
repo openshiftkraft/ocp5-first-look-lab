@@ -4,12 +4,14 @@ name: openshift-mcp-server
 # OpenShift MCP Server 1.0 (GA), tag 1.0 pinned by digest
 image: registry.redhat.io/openshift-mcp/openshift-mcp-server-rhel9@sha256:c6e59e791a0b934c5a33bf93e29e45b168ba81625f959794fecbdbf657996ac2
 
+# Toolset names of OpenShift MCP Server 1.0 ("metrics" became
+# "observability/metrics", "openshift" became "openshift/mustgather").
 toolsets:
   - core
   - config
-  - metrics
+  - observability/metrics
   - netedge
-  - openshift
+  - openshift/mustgather
   - ossm
 
 users:

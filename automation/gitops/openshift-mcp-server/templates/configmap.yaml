@@ -20,14 +20,10 @@ data:
     in doubt, prefer read-only operations and present findings before proposing changes.
     """
 
-    [toolset_configs.metrics]
+    [toolset_configs."observability/metrics"]
     prometheus_url = "https://thanos-querier.openshift-monitoring.svc.cluster.local:9091"
     insecure = true
     auth_mode = "header"
-
-    [toolset_configs.netedge]
-    auth_mode = "header"
-    insecure = true
 
     [toolset_configs.kiali]
     url = "https://kiali.istio-system.svc.cluster.local:20001"
